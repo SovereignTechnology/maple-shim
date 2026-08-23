@@ -1,0 +1,18 @@
+[Unit]
+Description=maple-shim: OpenAI-compatible audio API adapter for the Maple enclave
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=www-data
+Group=www-data
+ExecStart=/usr/bin/python3 /usr/local/bin/maple-shim.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
