@@ -9,7 +9,7 @@ holds no credentials — the client's Bearer key is relayed upstream.
   `maple-shim.service`, bound to `10.44.0.1:8176` (incus bridge only, same
   posture as camrecorder on 8175).
 - Published on the tailnet by Caddy as `https://100.64.0.11:62054`
-  (`caddy/services.tsv` row `maple-shim`; auburn-cowboys Local Root CA).
+  (`caddy/services.tsv` in cam/homelab-platform, row `maple-shim`; auburn-cowboys Local Root CA).
 - Endpoints:
   - `POST /v1/audio/speech` — OpenAI TTS request in, raw audio bytes out.
     Forces model `voxtral-tts`; maps OpenAI voice names (alloy, nova, ...) to
