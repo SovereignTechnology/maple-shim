@@ -14,6 +14,10 @@ Group=www-data
 LoadCredential=maple-keys:/etc/maple-shim/keys.env
 # /var/lib/maple-shim, created and chowned by systemd, holds the quota latch.
 StateDirectory=maple-shim
+# Every client now presents a per-client token, so an unrecognised bearer is a
+# misconfiguration and is rejected rather than quietly relayed upstream. Drop
+# this back to 0 only to re-onboard a client that cannot be reached to be fixed.
+Environment=MAPLE_SHIM_STRICT=1
 ExecStart=/usr/bin/python3 /usr/local/bin/maple-shim.py
 Restart=on-failure
 RestartSec=5

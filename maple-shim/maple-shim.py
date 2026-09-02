@@ -399,9 +399,15 @@ class Handler(BaseHTTPRequestHandler):
         label = _label_for(token)
         if label:
             return None, label
+        # Name the caller either way. Without this an unmigrated client is
+        # invisible: it either keeps working silently (non-strict) or starts
+        # failing somewhere else entirely (strict), with nothing here saying
+        # which machine it was.
         if STRICT:
+            _log(f"rejected unknown token from {self.client_address[0]} on {self.path}")
             self._reply_json(401, {"error": "unknown client token"})
             return None
+        _log(f"relaying a raw key for an unmigrated client at {self.client_address[0]} on {self.path}")
         return header, "unmigrated"
 
     def _proxy(self, path: str, data, content_type) -> None:
