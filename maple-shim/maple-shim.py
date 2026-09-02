@@ -164,7 +164,9 @@ def _tokens_now() -> dict:
                             continue
                         parts = line.split()
                         if len(parts) >= 2:
-                            table[parts[0]] = parts[1]
+                            # "<token> <label> [flag...]". Flags are optional and
+                            # per-client; see NATIVE_AUDIO_FLAG below.
+                            table[parts[0]] = (parts[1], frozenset(parts[2:]))
             except OSError as exc:
                 _log(f"cannot read {TOKENS_FILE}: {exc}")
                 return _tokens
@@ -174,13 +176,31 @@ def _tokens_now() -> dict:
         return _tokens
 
 
+# A client carrying this flag speaks the enclave's NATIVE audio contract
+# (JSON in, {content_base64, content_type} out) rather than OpenAI's. Home
+# Assistant's maple_tts does: it base64-decodes the JSON itself. Without the
+# flag the shim decodes for the caller and returns raw audio bytes, which that
+# component cannot parse. Flagging the client is what lets it move off a raw
+# Maple key onto a token without touching its code.
+NATIVE_AUDIO_FLAG = "native-audio"
+
+
 def _label_for(token: str):
     """Compare against every known token in constant time, so a timing signal
     cannot be used to recover one byte at a time."""
     match = None
-    for known, label in _tokens_now().items():
+    for known, (label, _flags) in _tokens_now().items():
         if hmac.compare_digest(known, token):
             match = label
+    return match
+
+
+def _flags_for(token: str) -> frozenset:
+    """Flags of the matching token, constant time for the same reason."""
+    match = frozenset()
+    for known, (_label, flags) in _tokens_now().items():
+        if hmac.compare_digest(known, token):
+            match = flags
     return match
 
 
@@ -388,6 +408,16 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._reply(resp.status, resp.read(), content_type)
 
+    def _wants_native_audio(self) -> bool:
+        """True when this caller wants the enclave's JSON audio contract back
+        untouched: either its token carries the native-audio flag, or it asked
+        per-request with a header."""
+        if self.headers.get("X-Maple-Native-Audio", "").strip() == "1":
+            return True
+        header = self.headers.get("Authorization") or ""
+        token = header[7:].strip() if header[:7].lower() == "bearer " else header.strip()
+        return NATIVE_AUDIO_FLAG in _flags_for(token)
+
     def _auth(self):
         """Resolve the caller. Returns (relay_key_or_None, label), or None when
         a reply has already been sent."""
@@ -529,11 +559,19 @@ class Handler(BaseHTTPRequestHandler):
         }
         if "speed" in req:
             payload["speed"] = float(req["speed"])
+        native = self._wants_native_audio()
         _tier, resp = _call(
             "/audio/speech", json.dumps(payload).encode(), "application/json", relay_key
         )
         with resp:
-            data = json.load(resp)
+            raw = resp.read()
+            upstream_type = resp.headers.get("Content-Type", "application/json")
+        if native:
+            # Hand back the enclave's JSON verbatim; the caller does its own
+            # base64 decode. Key injection and quota failover still applied.
+            self._reply(200, raw, upstream_type)
+            return
+        data = json.loads(raw)
         audio = base64.b64decode(data["content_base64"])
         self._reply(200, audio, data.get("content_type", "audio/mpeg"))
 

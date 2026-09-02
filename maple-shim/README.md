@@ -4,9 +4,13 @@ The single holder of the Maple API keys, in front of maple-proxy. Originally
 just an audio adapter; it now also brokers credentials and fails over between
 the Max and Pro plans.
 
-- Runs on the ubuntu-server host: `/usr/local/bin/maple-shim.py` +
-  `maple-shim.service`, bound to `10.44.0.1:8176` (incus bridge only, same
-  posture as camrecorder on 8175).
+- Runs as the Kata VM `maple-shim` on **10.44.0.64:8176** (2026-08-30 cutover;
+  `kata/host-workloads.tsv` in cam/homelab-platform). The script lives in the
+  image built from this directory's `Dockerfile` — editing
+  `/usr/local/bin/maple-shim.py` on the host now changes nothing. Rebuild,
+  `ctr images import`, retag `docker.io/kata/host-maple-shim:migrated`, then
+  `systemctl restart kata-maple-shim`. `keys.env` and `tokens` are bind-mounted
+  from the host, so the image still holds no secret.
 - Published on the tailnet by Caddy as `https://100.64.0.11:62054`
   (`caddy/services.tsv` in cam/homelab-platform, row `maple-shim`; auburn-cowboys Local Root CA).
 
@@ -23,7 +27,7 @@ Keys are delivered by systemd `LoadCredential=` from `/etc/maple-shim/keys.env`
 (0600 root). www-data never gets a readable copy on disk.
 
     /etc/maple-shim/keys.env    MAPLE_KEY_MAX=... / MAPLE_KEY_PRO=...   0600 root
-    /etc/maple-shim/tokens      "<token> <label>" per line, reloaded on mtime
+    /etc/maple-shim/tokens      "<token> <label> [flag...]" per line, on mtime
     /var/lib/maple-shim/state.json   quota latch (StateDirectory=)
 
 `MAPLE_SHIM_STRICT=1` rejects unknown tokens and logs the caller's IP. It is
@@ -91,3 +95,33 @@ ubuntu-server.
 
 Point any OpenAI-compatible client at `https://100.64.0.11:62054/v1` with its
 per-client token. Audio endpoints need the paid Maple tier.
+
+**Audio requires the patched maple-proxy image** (`ubuntu-server/maple-proxy/`):
+stock upstream 404s both audio paths at every version, so an unpatched proxy
+makes every audio call here fail with a relayed 404, while chat keeps working.
+
+## Token flags
+
+A third-and-later field on a `tokens` line is a flag for that client.
+
+- `native-audio` — return the enclave's audio JSON (`{content_base64,
+  content_type}`) verbatim instead of decoding it to raw bytes. Home
+  Assistant's `maple_tts` does its own base64 decode and cannot parse raw
+  audio, so this is what let it move off a raw Maple key onto a token without
+  touching the component. `X-Maple-Native-Audio: 1` does the same per request.
+  Key injection, quota failover and the latch all still apply.
+
+## Clients
+
+| client | endpoint | notes |
+|---|---|---|
+| opencode (latitude, laptop2) | Caddy `:62054` | token in `auth.json` |
+| openclaw (booty) | `127.0.0.1:18080` → socat → `:62054` | `maple-shim-tunnel.service` |
+| translate-gateway | `10.44.0.64:8176` | chat + `TTS_BACKEND`/`STT_BACKEND=maple` |
+| home-assistant | `10.44.0.64:8176/v1` | `native-audio`; `maple_tts` + `maple_stt` |
+
+Home Assistant was found on 2026-09-02 holding a **raw Pro key** and pointing
+straight at maple-proxy — outside the shim, so it had no failover and simply
+broke when Pro hit its usage limit. Its config lives in a container volume
+(`home-assistant/data/config/{configuration,secrets}.yaml`), which is why it was
+missed in the first inventory: grepping the laptops and booty cannot see it.
