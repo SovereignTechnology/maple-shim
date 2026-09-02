@@ -1,11 +1,19 @@
 [Unit]
-Description=maple-shim: OpenAI-compatible audio API adapter for the Maple enclave
+Description=maple-shim: Maple key broker, quota failover and audio adapter
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 User=www-data
 Group=www-data
+# The Maple keys are handed over as a systemd credential rather than as a file
+# www-data can open: /etc/maple-shim/keys.env stays 0600 root, and the only
+# readable copy lives in this service's credential tmpfs for the life of the
+# process. A group-readable key file would have been the weakest link in a
+# design whose whole point is that the keys exist in exactly one place.
+LoadCredential=maple-keys:/etc/maple-shim/keys.env
+# /var/lib/maple-shim, created and chowned by systemd, holds the quota latch.
+StateDirectory=maple-shim
 ExecStart=/usr/bin/python3 /usr/local/bin/maple-shim.py
 Restart=on-failure
 RestartSec=5
