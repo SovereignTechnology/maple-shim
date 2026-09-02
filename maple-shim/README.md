@@ -26,9 +26,24 @@ Keys are delivered by systemd `LoadCredential=` from `/etc/maple-shim/keys.env`
     /etc/maple-shim/tokens      "<token> <label>" per line, reloaded on mtime
     /var/lib/maple-shim/state.json   quota latch (StateDirectory=)
 
-`MAPLE_SHIM_STRICT=1` rejects unknown tokens. It is **off** until every client
-is migrated; until then an unrecognised bearer is relayed upstream untouched,
-exactly as this shim behaved before, so nothing breaks mid-migration.
+`MAPLE_SHIM_STRICT=1` rejects unknown tokens and logs the caller's IP. It is
+**on** (2026-09-01), so every client must hold a token from the table above.
+
+### Why keys.env and not the bw-agent broker
+
+`keys.env` is the runtime source of truth and stays that way. The bw-agent
+broker (`secret-run`/`secret-store`, Bitwarden `shared` collection) exists only
+on **latitude** — ubuntu-server has no broker, no `/etc/bw-agent`, and no unit.
+Standing one up here would give the host that runs all 24 Kata VMs unattended
+boot-time access to the *entire* `shared` collection, purely to fetch two keys.
+That is a strictly worse blast radius than one 0600 root file holding exactly
+those two keys, so it was rejected deliberately — do not "finish the migration".
+
+Both keys ARE in the vault as `maple-api-key-max` / `maple-api-key-pro`
+(stored 2026-09-01), but as the durable record for recovery and rotation, not
+as a runtime dependency. Rotating a plan key means: update the vault item,
+update `keys.env`, `systemctl restart maple-shim`. Clients are untouched —
+that is the whole point of the token indirection.
 
 ## Quota failover
 
