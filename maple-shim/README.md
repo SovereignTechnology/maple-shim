@@ -118,10 +118,24 @@ A third-and-later field on a `tokens` line is a flag for that client.
 | opencode (latitude, laptop2) | Caddy `:62054` | token in `auth.json` |
 | openclaw (booty) | `127.0.0.1:18080` → socat → `:62054` | `maple-shim-tunnel.service` |
 | translate-gateway | `10.44.0.64:8176` | chat + `TTS_BACKEND`/`STT_BACKEND=maple` |
-| home-assistant | `10.44.0.64:8176/v1` | `native-audio`; `maple_tts` + `maple_stt` |
+| home-assistant | `10.44.0.64:8176/v1` | `native-audio`; `maple_tts` + `maple_stt` + `llama_conversation` |
 
 Home Assistant was found on 2026-09-02 holding a **raw Pro key** and pointing
 straight at maple-proxy — outside the shim, so it had no failover and simply
 broke when Pro hit its usage limit. Its config lives in a container volume
 (`home-assistant/data/config/{configuration,secrets}.yaml`), which is why it was
 missed in the first inventory: grepping the laptops and booty cannot see it.
+
+HA holds Maple credentials in **two** places, and both had the raw Pro key:
+
+- `secrets.yaml` → `maple_api_key`, used by `maple_tts` + `maple_stt`.
+- `.storage/core.config_entries` → the `llama_conversation` entry (a HACS
+  component, "Generic OpenAI"), which is the LLM behind the **Maple** assist
+  pipeline (`stt=maple_stt`, `tts=maple_tts`, conversation =
+  `deepseek-v4-flash`). Restoring the audio routes alone would have left the
+  pipeline mute anyway, because its brain was 403ing.
+
+That entry is edited by stopping HA, rewriting the JSON, then starting it —
+HA rewrites `.storage` on shutdown, so editing it live loses the change. Note
+`port` is stored as a **string**: writing an int makes the component fail setup
+in `format_url` with no useful message.
