@@ -17,7 +17,7 @@ the Max and Pro plans.
 ## Why it holds the keys
 
 The Maple key used to live in six places across four hosts — opencode on two
-laptops, openclaw on booty, the translate gateway, plus a ccr config and a
+laptops, openclaw on booty, ourtranslate, plus a ccr config and a
 maple-fusion `.env`. Clients now present a **per-client token** from
 `/etc/maple-shim/tokens` and the shim swaps it for the real key, so revoking
 one machine does not mean re-keying the rest, and a leaked client config leaks
@@ -117,7 +117,7 @@ A third-and-later field on a `tokens` line is a flag for that client.
 |---|---|---|
 | opencode (latitude, laptop2) | Caddy `:62054` | token in `auth.json` |
 | openclaw (booty) | `127.0.0.1:18080` → socat → `:62054` | `maple-shim-tunnel.service` |
-| translate-gateway | `10.44.0.64:8176` | chat + `TTS_BACKEND`/`STT_BACKEND=maple` |
+| ourtranslate | `10.44.0.64:8176` | chat + `TTS_BACKEND`/`STT_BACKEND=maple` |
 | home-assistant | `10.44.0.64:8176/v1` | `native-audio`; `maple_tts` + `maple_stt` + `llama_conversation` |
 
 Home Assistant was found on 2026-09-02 holding a **raw Pro key** and pointing

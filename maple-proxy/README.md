@@ -4,7 +4,7 @@
 `audio-endpoints.patch` (2 router lines): the stock proxy 404s
 `/v1/audio/speech` and `/v1/audio/transcriptions`, but the opensecret crate and
 the enclave support both. Home Assistant's maple_tts/maple_stt components and
-the translate gateway's voice path depend on these routes.
+ourtranslate's voice path depend on these routes.
 
 **The patch is not optional and it is not a nicety.** Stock upstream has never
 routed audio at *any* version — 0.1.8, 0.1.11, 0.3.2 and master all have the
@@ -22,7 +22,7 @@ container (`incus file push`), so the patch lived only in that container's
 writable layer. The Kata cutover on 2026-08-30 built its image from the
 2026-08-28 Incus **image** export, which never contained that binary — so the
 patch vanished and audio has 404'd since, silently: `/v1/models` and chat kept
-working, and the only symptom was `404 Not Found` in translate-gateway's log
+working, and the only symptom was `404 Not Found` in ourtranslate's log
 and a dead HA voice pipeline.
 
 Baking it into the image means restarts, reboots, VM migrations and rebuilds
