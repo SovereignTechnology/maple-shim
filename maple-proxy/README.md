@@ -46,7 +46,7 @@ On ubuntu-server (dockerd is stopped by design; containerd is the runtime):
     systemctl restart kata-maple-proxy
 
 The image ref is generated from `incus/containers.tsv` column 2 in
-cam/homelab-platform (`maple-proxy-0.3.2-audio`); change it there, not by hand
+sovtech/platform (`maple-proxy-0.3.2-audio`); change it there, not by hand
 in the unit. Rollback: set the column back to `maple-proxy-0.3.2` (stock, still
 imported, audio 404s) and restart. `ctr` renders the hyphen in a ref as a space
 in its own output — never parse that output for a ref.

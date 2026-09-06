@@ -5,14 +5,14 @@ just an audio adapter; it now also brokers credentials and fails over between
 the Max and Pro plans.
 
 - Runs as the Kata VM `maple-shim` on **10.44.0.64:8176** (2026-08-30 cutover;
-  `kata/host-workloads.tsv` in cam/homelab-platform). The script lives in the
+  `kata/host-workloads.tsv` in sovtech/platform). The script lives in the
   image built from this directory's `Dockerfile` — editing
   `/usr/local/bin/maple-shim.py` on the host now changes nothing. Rebuild,
   `ctr images import`, retag `docker.io/kata/host-maple-shim:migrated`, then
   `systemctl restart kata-maple-shim`. `keys.env` and `tokens` are bind-mounted
   from the host, so the image still holds no secret.
 - Published on the tailnet by Caddy as `https://100.64.0.11:62054`
-  (`caddy/services.tsv` in cam/homelab-platform, row `maple-shim`; auburn-cowboys Local Root CA).
+  (`caddy/services.tsv` in sovtech/platform, row `maple-shim`; auburn-cowboys Local Root CA).
 
 ## Why it holds the keys
 
