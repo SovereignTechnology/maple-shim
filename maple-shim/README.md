@@ -131,11 +131,54 @@ HA holds Maple credentials in **two** places, and both had the raw Pro key:
 - `secrets.yaml` → `maple_api_key`, used by `maple_tts` + `maple_stt`.
 - `.storage/core.config_entries` → the `llama_conversation` entry (a HACS
   component, "Generic OpenAI"), which is the LLM behind the **Maple** assist
-  pipeline (`stt=maple_stt`, `tts=maple_tts`, conversation =
-  `deepseek-v4-flash`). Restoring the audio routes alone would have left the
-  pipeline mute anyway, because its brain was 403ing.
+  pipeline (`stt=maple_stt`, `tts=maple_tts`, conversation = **`glm-5-3`**,
+  was `deepseek-v4-flash` until 2026-09-13). Restoring the audio routes alone
+  would have left the pipeline mute anyway, because its brain was 403ing.
 
 That entry is edited by stopping HA, rewriting the JSON, then starting it —
 HA rewrites `.storage` on shutdown, so editing it live loses the change. Note
 `port` is stored as a **string**: writing an int makes the component fail setup
 in `format_url` with no useful message.
+
+### Changing the conversation model
+
+The field is `subentries[].data.huggingface_model` (`const.py:90` defines
+`CONF_CHAT_MODEL = "huggingface_model"`). It reaches the wire as the request
+`model` via `entity.py:695` → `generic_openai.py:108` → `:121`. Set the
+subentry `title` to the same value: it drives the device and entity friendly
+names (`entity.py:655-660`). Nothing else needs touching.
+
+**Do not rename the entity_id, and do not expect it to follow.** It is
+`conversation.deepseek_v4_flash_deepseek_v4_flash` and it will keep that name
+forever, because `_attr_unique_id = subentry.subentry_id` is a ULID — the
+registry is keyed on that, not on the model string. It looks wrong and it is
+deliberate: the **`Maple` assist pipeline binds that entity_id**
+(`.storage/assist_pipeline.pipelines`) and the recorder history in
+`home-assistant_v2.db` is keyed on it, so renaming would mute the voice
+pipeline and orphan the history for a cosmetic gain. `original_name` and the
+device name in `core.{entity,device}_registry` also stay at the old value after
+a restart; they are display-only.
+
+### GLM landmine: never send `enable_thinking: false` from HA
+
+Measured against the shim on 2026-09-13, with an HA-shaped assist request:
+
+| request | reasoning lands in | spoken text |
+|---|---|---|
+| default (what HA sends) | nowhere — 0 chars | clean answer |
+| `chat_template_kwargs: {enable_thinking: false}` | **`content`** | *"The user wants to know if the nursery air conditioner is on… Let me use the HassGetState tool"* |
+
+`enable_thinking:false` does not stop GLM reasoning, it **relocates the chain
+into `content`** — and `content` is exactly what `maple_tts` speaks aloud. It
+arrives without `<think>` tags, so the component's `thinking_prefix` /
+`thinking_suffix` stripping does not catch it. `llama_conversation` sends no
+`chat_template_kwargs` at all, so the default path is safe; the hazard is only
+if someone adds one. The same applies to `reasoning_effort` on GLM — see the
+measurements in `~/.config/opencode/opencode.jsonc:307-313`.
+
+Second-turn latency (the reply that gets spoken, median of 3):
+`glm-5-3` 4.0s [4.0–4.4] · `glm-5-3-flash` 4.5s [3.3–8.3] ·
+`deepseek-v4-flash` 5.2s [4.1–8.1]. Both GLM variants tool-called correctly and
+neither leaked reasoning at default settings. `glm-5-3` was chosen for the
+tightest spread. Note `glm-5-3-flash` exists on the enclave but postdates the
+2026-09-02 catalogue refresh in `opencode.jsonc`.
