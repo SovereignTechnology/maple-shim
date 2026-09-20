@@ -51,24 +51,70 @@ that is the whole point of the token indirection.
 
 ## Quota failover
 
-Max is used until the enclave says it is spent, then Pro.
+Max is used until it stops serving, then Pro.
 
-Exhaustion is **HTTP 403 with `Usage limit reached` in the body** — not 429,
-and not every 403, since a rejected key is also 403. Both the status and the
-body are checked; treating a bad key as exhaustion would burn the other plan's
-quota on a request that was going to fail anyway. Note `/v1/models` keeps
-answering normally on an exhausted key, so exhaustion is only ever detectable
-on a real inference call.
+**Failing over and latching are separate decisions, and that separation is the
+whole design.** *Any* refusal moves to the next tier. Only a refusal we can
+attribute to quota writes an exhaustion latch.
+
+- **Failover** on any upstream error — any HTTP status, and transport failures
+  too. Cost of being wrong: one extra round trip on a request that had already
+  failed.
+- **Latch** only on `402`, `429`, or a `403` carrying one of `QUOTA_MARKERS`
+  (`usage limit`, `token limit`, `quota`, `insufficient credit`). `403` alone is
+  not enough, because a rejected key is also a `403`. Cost of being wrong: a
+  credential failure reported as a billing one, in `/health` and over Signal,
+  until the tier's reset day.
+
+`401` is deliberately **not** a latching signal even though a spent plan is the
+likeliest cause of one here — see below.
+
+### What exhaustion actually looks like (measured 2026-09-20)
+
+A spent Max plan refuses `/v1/chat/completions` with a bare
+`401 {"status":401,"message":"Unauthorized"}`, streaming or not, **while
+`/v1/models` and `/v1/embeddings` keep answering 200 on the same key.** There is
+no `403`, no marker string, and nothing to distinguish it from a revoked key
+except that the key demonstrably still works elsewhere.
+
+This is why the endpoint went down rather than failing over. The original rule —
+fail over only on `403` + `usage limit`, re-raise everything else — could not
+match it, so every request hard-failed on Max, Pro was never tried, no latch was
+written, and **nothing was logged at all**. `active_tier` therefore never changed,
+so booty's Signal watcher stayed silent too. The enclave's *other* exhaustion
+error, `Free tier token limit exceeded` (fired above 20k input tokens once an
+account drops to free-tier behaviour), was missed by the same rule.
+
+A tier that refuses for an unattributable reason gets a **cooldown**
+(`MAPLE_COOLDOWN_SECONDS`, default 900) instead of a latch: demoted, retried
+soon, and never described as "exhausted".
+
+### Ordering and self-healing
+
+`_tier_order()` ranks tiers healthy → cooling down → latched, and the sort is
+stable, so equal-health tiers keep `TIER_ORDER` and Max stays preferred over Pro.
+Every configured tier is still *attempted*, so a stale latch or cooldown heals
+itself rather than locking you out.
 
 Max resets on the **1st**, Pro on the **15th**, so a latch is not a timer: it
 expires at the next occurrence of its own reset day. A latch cleared too early
-(their reset timezone need not match ours) costs one wasted round trip — the
-call 403s and re-latches. A latched tier is still tried as a last resort, so a
-stale latch heals itself instead of locking you out.
+(their reset timezone need not match ours) costs one wasted round trip.
+
+**`/v1/models` answers on a spent key, so a 200 from it is not evidence of
+health** and must never clear a latch — `_call(..., consumes_quota=False)`.
+opencode's `maple-sync.ts` polls it on every startup, so without that guard one
+catalogue refresh silently un-latches a spent tier.
 
 Failover only happens before the response starts: urllib raises on a non-2xx
 before any byte reaches the client. Once an SSE stream has begun, that request
 is committed to its tier.
+
+### Tests
+
+`./tests-failover.sh` runs the real script against a stub enclave on loopback
+with fake keys — no credentials, no network, no fleet access. It covers all of
+the above, including the 401 case verbatim. Against the pre-2026-09-20 code it
+fails 12 of 14.
 
 ## Notification
 
@@ -80,7 +126,10 @@ ubuntu-server.
 
 ## Endpoints
 
-- `GET  /health` — active tier, per-tier latch and reset date. No secrets.
+- `GET  /health` — active tier, and per-tier `configured`, `exhausted`,
+  `exhausted_at`, `resets`, `cooling_down`, `cooldown_until` and `last_error`
+  (the upstream status and first 200 bytes of its message). No secrets.
+  `resets` is reported whenever `exhausted_at` is set, not only while latched.
 - `GET  /v1/models`
 - `POST /v1/chat/completions` — streaming and non-streaming. SSE is relayed
   chunk by chunk under chunked transfer encoding; the body is forwarded as raw

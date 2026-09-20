@@ -11,13 +11,20 @@ Three jobs in a single process, because they all need the same credential:
      LoadCredential, so only this service can read them -- there is no
      group-readable copy sitting on disk.
 
-  2. Quota failover. Max is used until the enclave says it is spent, then Pro.
-     Exhaustion is HTTP 403 with "Usage limit reached" in the body. It is NOT
-     429, and it is NOT every 403 -- a rejected key is a 403 too -- so both the
-     status and the body are checked before failing over; treating a bad key as
-     exhaustion would spend the other plan's quota on a doomed request.
-     /v1/models keeps answering happily on an exhausted key, so this is only
-     ever visible on a real inference call. A health probe cannot see it coming.
+  2. Quota failover. Max is used until it stops serving, then Pro. ANY refusal
+     moves to the next tier; only a recognised quota signal writes an
+     exhaustion latch. The two are separate on purpose, because the enclave
+     does not always say why it is refusing. Measured 2026-09-20: a spent Max
+     plan refuses /v1/chat/completions with a bare 401 Unauthorized, while
+     /v1/models and /v1/embeddings keep answering on the same key. A 401 is
+     also what a revoked key returns, so latching on it would report a
+     credential failure as a billing one for the rest of the month -- but
+     refusing to fail over on it, which is what this shim did until now, means
+     a spent plan takes the endpoint down and logs nothing at all.
+     A tier that refuses for a reason we cannot attribute gets a short
+     cooldown instead of a latch, so it is retried soon rather than probed on
+     every single request. /v1/models keeps answering on a spent key, so it is
+     never treated as evidence that a tier is healthy.
 
      Max resets on the 1st and Pro on the 15th, so a latch is not a duration:
      it expires at the next occurrence of its own reset day. Clearing a latch
@@ -48,7 +55,7 @@ import sys
 import threading
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from email import policy
 from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -75,6 +82,18 @@ STATE_FILE = os.path.join(STATE_DIR, "state.json")
 # Day of the month on which each plan's quota resets.
 RESET_DAY = {"max": 1, "pro": 15}
 TIER_ORDER = ("max", "pro")
+
+# Substrings that identify a spent plan in an upstream 403 body. 403 is
+# overloaded -- a rejected key is a 403 too -- so a marker must match before a
+# tier is latched. "token limit" catches the enclave's second exhaustion error,
+# "Free tier token limit exceeded", which fires on any request over 20k input
+# tokens once an account has dropped to free-tier behaviour.
+QUOTA_MARKERS = (b"usage limit", b"token limit", b"quota", b"insufficient credit")
+
+# How long a tier is demoted after a refusal that cannot be attributed to quota.
+# Long enough that a dead tier is not re-probed on every request, short enough
+# that a fixed key is picked up again without anyone intervening.
+COOLDOWN_SECONDS = int(os.environ.get("MAPLE_COOLDOWN_SECONDS", "900"))
 
 # OpenAI voice names -> nearest Maple voice; native Maple names pass through.
 VOICE_MAP = {
@@ -107,6 +126,22 @@ EXT_CONTENT_TYPES = {
 
 def _log(msg: str) -> None:
     print(f"maple-shim: {msg}", file=sys.stderr, flush=True)
+
+
+def _redact(text: str) -> str:
+    """Strip any Maple key that an upstream error echoed back at us.
+
+    Error bodies are recorded in state.json and in the journal, and state.json
+    is world-readable on the host. This redacts by the values we actually hold
+    rather than by guessing at a token shape -- an entropy heuristic fails
+    exactly when the key's format uses a character the pattern did not allow
+    for. KEYS is not yet bound the first time this module is imported, so the
+    lookup is guarded.
+    """
+    for value in (globals().get("KEYS") or {}).values():
+        if value and value in text:
+            text = text.replace(value, "<redacted>")
+    return text
 
 
 def _load_keys() -> dict:
@@ -247,14 +282,21 @@ def _latched(tier: str, state: dict, now: datetime) -> bool:
 
 
 def _tier_order(state: dict) -> list:
-    """Unlatched tiers first, latched ones after -- but latched tiers are still
-    attempted rather than refused outright. If a latch is stale the request
-    succeeds and clears it; if it is not, the 403 comes straight back."""
+    """Healthy tiers first, then ones serving a cooldown, then ones known to be
+    spent -- but every configured tier is still attempted rather than refused
+    outright. If a latch or a cooldown is stale the request succeeds and clears
+    it; if it is not, the refusal comes straight back. The sort is stable, so
+    tiers of equal health keep TIER_ORDER and Max stays preferred over Pro."""
     now = datetime.now()
-    configured = [t for t in TIER_ORDER if KEYS.get(t)]
-    return [t for t in configured if not _latched(t, state, now)] + [
-        t for t in configured if _latched(t, state, now)
-    ]
+
+    def rank(tier: str) -> int:
+        if _latched(tier, state, now):
+            return 2
+        if _cooled(tier, state, now):
+            return 1
+        return 0
+
+    return sorted((t for t in TIER_ORDER if KEYS.get(t)), key=rank)
 
 
 def _set_latch(tier: str, exhausted: bool):
@@ -271,8 +313,69 @@ def _set_latch(tier: str, exhausted: bool):
         return previous
 
 
-def _is_quota(body: bytes) -> bool:
-    return b"usage limit" in (body or b"").lower()
+def _record_error(tier: str, code: int, body: bytes) -> None:
+    """Remember why a tier last refused, and demote it briefly.
+
+    Without this a failing tier is invisible. The shim relayed the upstream
+    status to the client and logged nothing, so a plan that had stopped
+    serving left no trace in /health, none in the journal, and none in the
+    Signal watcher -- which only fires when the active tier changes, and the
+    active tier cannot change if nothing is ever recorded against it.
+    """
+    message = _redact((body or b"")[:200].decode("utf-8", "replace").strip())
+    now = datetime.now()
+    with _state_lock:
+        state = _read_state()
+        entry = state.setdefault(tier, {})
+        entry["last_error"] = {
+            "at": now.isoformat(timespec="seconds"),
+            "code": code,
+            "message": message,
+        }
+        entry["cooldown_until"] = (
+            now + timedelta(seconds=COOLDOWN_SECONDS)
+        ).isoformat(timespec="seconds")
+        _write_state(state)
+
+
+def _clear_error(tier: str) -> bool:
+    """Drop a tier's recorded refusal once it answers again. Returns True when
+    there was something to clear, so only transitions get logged."""
+    with _state_lock:
+        state = _read_state()
+        entry = state.setdefault(tier, {})
+        had = bool(entry.get("last_error") or entry.get("cooldown_until"))
+        entry.pop("last_error", None)
+        entry.pop("cooldown_until", None)
+        if had:
+            _write_state(state)
+        return had
+
+
+def _cooled(tier: str, state: dict, now: datetime) -> bool:
+    """True while this tier is serving out a post-refusal cooldown."""
+    stamp = (state.get(tier) or {}).get("cooldown_until")
+    if not stamp:
+        return False
+    try:
+        return now < datetime.fromisoformat(stamp)
+    except ValueError:
+        return False
+
+
+def _is_quota(code: int, body: bytes) -> bool:
+    """True when the upstream is refusing because a plan is spent.
+
+    402 and 429 are unambiguous. 403 is not -- a rejected key is also a 403 --
+    so it needs a marker in the body. 401 is deliberately absent even though a
+    spent plan is the likeliest cause of one here: a revoked key is
+    indistinguishable, and a latch claims a specific reason that /health and
+    the Signal watcher then report as fact. Failing over on it is right;
+    naming it exhaustion is not.
+    """
+    if code in (402, 429):
+        return True
+    return code == 403 and any(m in (body or b"").lower() for m in QUOTA_MARKERS)
 
 
 class _UpstreamError(Exception):
@@ -297,13 +400,24 @@ def _open(path: str, data, content_type, key: str):
     return urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT)
 
 
-def _call(path: str, data, content_type, relay_key=None):
-    """Send a request upstream on the best available tier, failing over on a
-    quota 403. Returns (tier, response).
+def _call(path: str, data, content_type, relay_key=None, consumes_quota=True):
+    """Send a request upstream on the best available tier, moving to the next
+    one when a tier refuses. Returns (tier, response).
 
     Failing over is only safe here because urllib raises on a non-2xx before
     any byte has been handed to the client: once a stream has started, the
     tier is committed for that request.
+
+    Any refusal moves on; only a recognised quota signal latches. Guessing
+    wrong in the latching direction mislabels a credential failure as a
+    billing one for a month. Guessing wrong in the failover direction costs
+    one extra round trip on a request that was already lost -- and the version
+    of this loop that raised instead of continuing is what left the endpoint
+    down, silently, on a spent plan that answered 401 rather than 403.
+
+    consumes_quota=False marks an endpoint that answers regardless of plan
+    state -- /v1/models does -- so polling it cannot clear a latch that a real
+    inference call set.
     """
     if relay_key is not None:
         return "relay", _open(path, data, content_type, relay_key)
@@ -315,20 +429,37 @@ def _call(path: str, data, content_type, relay_key=None):
             resp = _open(path, data, content_type, KEYS[tier])
         except urllib.error.HTTPError as exc:
             body = exc.read()
-            if exc.code == 403 and _is_quota(body):
+            last = _UpstreamError(exc.code, body, exc.headers.get("Content-Type"))
+            if _is_quota(exc.code, body):
                 if not _set_latch(tier, True):
-                    _log(f"tier {tier} exhausted (403 usage limit) - failing over")
-                last = _UpstreamError(exc.code, body, exc.headers.get("Content-Type"))
-                continue
-            raise _UpstreamError(exc.code, body, exc.headers.get("Content-Type"))
-        # A tier that answers is not exhausted, whatever the state file claimed.
-        if (state.get(tier) or {}).get("exhausted_at"):
-            _set_latch(tier, False)
-            _log(f"tier {tier} answering again - latch cleared")
+                    _log(f"tier {tier} exhausted ({exc.code}) - failing over")
+            else:
+                detail = _redact(body[:200].decode("utf-8", "replace").strip())
+                _log(f"tier {tier} refused with {exc.code}: {detail!r} - trying next tier")
+            _record_error(tier, exc.code, body)
+            continue
+        except urllib.error.URLError as exc:
+            # HTTPError is a subclass of URLError and is handled above, so this
+            # is a transport failure: DNS, connect, TLS or timeout.
+            reason = _redact(str(exc.reason))
+            _log(f"tier {tier} unreachable: {reason} - trying next tier")
+            last = _UpstreamError(
+                502, b'{"error":"upstream unreachable"}', "application/json"
+            )
+            _record_error(tier, 502, reason.encode())
+            continue
+        # A tier that answers is healthy, whatever the state file claimed -- but
+        # only an endpoint that actually spends quota is evidence of that.
+        if consumes_quota:
+            if (state.get(tier) or {}).get("exhausted_at"):
+                _set_latch(tier, False)
+                _log(f"tier {tier} answering again - latch cleared")
+            if _clear_error(tier):
+                _log(f"tier {tier} answering again - cooldown cleared")
         return tier, resp
 
     if last is not None:
-        _log("every tier is exhausted")
+        _log("every tier refused")
         raise last
     raise _UpstreamError(503, b'{"error":"no maple key configured"}', "application/json")
 
@@ -440,12 +571,12 @@ class Handler(BaseHTTPRequestHandler):
         _log(f"relaying a raw key for an unmigrated client at {self.client_address[0]} on {self.path}")
         return header, "unmigrated"
 
-    def _proxy(self, path: str, data, content_type) -> None:
+    def _proxy(self, path: str, data, content_type, consumes_quota=True) -> None:
         auth = self._auth()
         if auth is None:
             return
         relay_key, _label = auth
-        tier, resp = _call(path, data, content_type, relay_key)
+        tier, resp = _call(path, data, content_type, relay_key, consumes_quota)
         with resp:
             self._relay(resp)
         del tier
@@ -465,19 +596,28 @@ class Handler(BaseHTTPRequestHandler):
         now = datetime.now()
         tiers = {}
         for tier in TIER_ORDER:
-            stamp = (state.get(tier) or {}).get("exhausted_at")
+            entry = state.get(tier) or {}
+            stamp = entry.get("exhausted_at")
             latched = _latched(tier, state, now)
+            resets = None
+            if stamp:
+                try:
+                    resets = _next_reset(
+                        datetime.fromisoformat(stamp), RESET_DAY[tier]
+                    ).isoformat()
+                except ValueError:
+                    resets = None
             tiers[tier] = {
                 "configured": bool(KEYS.get(tier)),
                 "exhausted": latched,
                 "exhausted_at": stamp,
-                "resets": (
-                    _next_reset(
-                        datetime.fromisoformat(stamp), RESET_DAY[tier]
-                    ).isoformat()
-                    if latched
-                    else None
-                ),
+                # Reported whenever a stamp exists, not only while latched: an
+                # unlatched tier showing a stale exhausted_at beside a null
+                # resets reads as a live problem that has already cleared.
+                "resets": resets,
+                "cooling_down": _cooled(tier, state, now),
+                "cooldown_until": entry.get("cooldown_until"),
+                "last_error": entry.get("last_error"),
             }
         order = _tier_order(state)
         self._reply_json(
@@ -508,7 +648,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._dispatch(self._health)
         elif self.path in ("/v1/models", "/models"):
-            self._dispatch(self._proxy, "/models", None, None)
+            # Answers on a spent plan, so a 200 here is not evidence of health
+            # and must not clear a latch a real inference call set.
+            self._dispatch(self._proxy, "/models", None, None, False)
         else:
             self._reply_json(404, {"error": "not found"})
 
