@@ -104,6 +104,12 @@ expires at the next occurrence of its own reset day. A latch cleared too early
 health** and must never clear a latch — `_call(..., consumes_quota=False)`.
 opencode's `maple-sync.ts` polls it on every startup, so without that guard one
 catalogue refresh silently un-latches a spent tier.
+**`/v1/embeddings` is the same** (it answers on a spent key too): only
+`/v1/chat/completions` counts as evidence. It shares the chat route, so the guard
+is `consumes_quota = (path == "/v1/chat/completions")`. Found in review 2026-09-25;
+it only bites with **both** tiers latched (month's end), when Max is tried first
+and an embeddings 200 would clear its latch. Tests 4c/4d cover it and fail on the
+code without the guard.
 
 Failover only happens before the response starts: urllib raises on a non-2xx
 before any byte reaches the client. Once an SSE stream has begun, that request

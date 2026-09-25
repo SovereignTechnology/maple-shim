@@ -13,7 +13,7 @@
 #      the client and never try Pro, which is what took the endpoint down.
 #   2. The enclave's OTHER exhaustion error, "Free tier token limit exceeded",
 #      which does not contain the substring the old detector looked for.
-#   4. /v1/models answering on a spent key must not clear an exhaustion latch --
+#   4. /v1/models or /v1/embeddings answering on a spent key must not clear an exhaustion latch --
 #      opencode's maple-sync plugin polls it on every startup.
 #
 # usage: ./tests-failover.sh [path-to-maple-shim.py]
@@ -67,6 +67,9 @@ class H(BaseHTTPRequestHandler):
         if path == "/models":
             # Answers regardless of plan state, exactly like the real enclave.
             return self._send(200, json.dumps({"data": [{"id": "glm-5-3"}]}).encode())
+        if path == "/embeddings":
+            # So does /v1/embeddings (measured 2026-09-20 on a spent Max key).
+            return self._send(200, json.dumps({"data": [{"embedding": [0.0]}], "served_by": tier}).encode())
         status = int(cfg().get(f"{tier}_status", "200"))
         if status == 200:
             return self._send(200, json.dumps(
@@ -91,6 +94,9 @@ chat() { curl -sS -m 10 -o "$t/out.json" -w '%{http_code}' \
   http://127.0.0.1:9176/v1/chat/completions -d '{"model":"glm-5-3","messages":[]}'; }
 models() { curl -sS -m 5 -o /dev/null -w '%{http_code}' \
   -H 'Authorization: Bearer testtoken123' http://127.0.0.1:9176/v1/models; }
+embed() { curl -sS -m 5 -o /dev/null -w '%{http_code}' \
+  -H 'Authorization: Bearer testtoken123' -H 'Content-Type: application/json' \
+  http://127.0.0.1:9176/v1/embeddings -d '{"model":"nomic-embed-text","input":"x"}'; }
 latched() { python3 -c 'import json,sys;print("yes" if (json.load(open(sys.argv[1])).get(sys.argv[2]) or {}).get("exhausted_at") else "no")' "$t/state.json" "$1" 2>/dev/null || echo missing; }
 
 start_shim() {
@@ -138,6 +144,15 @@ m=$(models)
 [ "$(latched max)" = yes ] && ok "4b /v1/models did NOT clear the Max latch" || no "4b /v1/models did NOT clear the Max latch" "cleared"
 c=$(chat)
 [ "$c" = 200 ] && [ "$(latched max)" = no ] && ok "5  real inference clears a stale latch" || no "5  real inference clears a stale latch" "http $c, latched $(latched max)"
+stop_shim
+
+# 4c/4d -- /v1/embeddings also answers on a spent plan. With BOTH tiers latched (month's end)
+# the shim tries Max first (stable order), and a 200 there must not clear its latch.
+rm -f "$t/state.json"; setb 'max_status=403' 'pro_status=403'; start_shim
+chat >/dev/null
+e=$(embed)
+[ "$e" = 200 ] && ok "4c /v1/embeddings answers on spent plans" || no "4c /v1/embeddings answers on spent plans" "got $e"
+[ "$(latched max)" = yes ] && ok "4d /v1/embeddings did NOT clear the Max latch" || no "4d /v1/embeddings did NOT clear the Max latch" "cleared"
 stop_shim
 
 # 6 -- nothing left to try.

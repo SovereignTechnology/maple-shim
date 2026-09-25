@@ -662,11 +662,16 @@ class Handler(BaseHTTPRequestHandler):
             # Forward the raw bytes: maple-proxy passes provider-specific JSON
             # fields through untouched, and re-serialising here would quietly
             # drop the ones this shim does not know about.
+            # Only a chat completion is evidence that a tier's quota is live:
+            # /v1/embeddings keeps answering on a spent plan, exactly like
+            # /v1/models (measured 2026-09-20), so a 200 from it must not clear
+            # a latch that a real inference call set.
             self._dispatch(
                 self._proxy,
                 self.path[3:],
                 body,
                 self.headers.get("Content-Type", "application/json"),
+                self.path == "/v1/chat/completions",
             )
         elif self.path == "/v1/audio/speech":
             self._dispatch(self._speech)
