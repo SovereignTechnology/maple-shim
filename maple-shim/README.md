@@ -9,7 +9,12 @@ the Max and Pro plans.
   image built from this directory's `Dockerfile` — editing
   `/usr/local/bin/maple-shim.py` on the host now changes nothing. Rebuild,
   `ctr images import`, retag `docker.io/kata/host-maple-shim:migrated`, then
-  `systemctl restart kata-maple-shim`. `keys.env` and `tokens` are bind-mounted
+  `systemctl restart kata-maple-shim`.
+  **No docker is needed (dockerd stays disabled on ubuntu-server):** the 2026-09-25 deploy of
+  !9 built the image as the RUNNING image plus ONE layer carrying `maple-shim.py`, config and
+  command unchanged, imported as `:failover` and retagged `:migrated`
+  (`sha256:ea252f30…`). Rollback: `ctr images tag --force docker.io/kata/host-maple-shim:pre-failover
+  docker.io/kata/host-maple-shim:migrated` and restart. Build dir `/root/build/maple-shim-<ts>/`. `keys.env` and `tokens` are bind-mounted
   from the host, so the image still holds no secret.
 - Published on the tailnet by Caddy as `https://100.64.0.11:62054`
   (`caddy/services.tsv` in sovtech/platform, row `maple-shim`; auburn-cowboys Local Root CA).
