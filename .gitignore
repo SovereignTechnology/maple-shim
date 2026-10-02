@@ -1,0 +1,5 @@
+# Timestamped backup copies left behind by in-place edits.
+*.bak-*
+
+__pycache__/
+*.pyc

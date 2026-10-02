@@ -156,7 +156,7 @@ ubuntu-server.
 Point any OpenAI-compatible client at `https://100.64.0.11:62054/v1` with its
 per-client token. Audio endpoints need the paid Maple tier.
 
-**Audio requires the patched maple-proxy image** (`ubuntu-server/maple-proxy/`):
+**Audio requires the patched maple-proxy image** (`maple-proxy/` in this repo):
 stock upstream 404s both audio paths at every version, so an unpatched proxy
 makes every audio call here fail with a relayed 404, while chat keeps working.
 
