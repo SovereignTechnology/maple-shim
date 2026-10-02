@@ -1,33 +1,29 @@
-# maple-proxy: audio endpoint patch (patched binary 2026-08-22, baked into an image 2026-09-02)
+# maple-proxy: audio endpoint patch (upstream 0.4.1, monorepo)
 
 > **Upstream status (checked 2026-10-02).** The standalone
 > `OpenSecretCloud/maple-proxy` repo was **retired on 2026-09-08**; development
-> moved to [`MaplePrivacyLabs/Maple`, `proxy/`](https://github.com/MaplePrivacyLabs/Maple/tree/master/proxy),
-> now at **0.4.1**. Replacement images publish to
-> `ghcr.io/mapleprivacylabs/maple-proxy` (tags `0.4.0`/`latest`); the legacy
-> `ghcr.io/opensecretcloud/maple-proxy` publisher is disabled, so its `latest`
-> no longer tracks new releases.
+> moved to [`MaplePrivacyLabs/Maple`, `proxy/`](https://github.com/MaplePrivacyLabs/Maple/tree/master/proxy).
+> Replacement images publish to `ghcr.io/mapleprivacylabs/maple-proxy`
+> (tags `0.4.0`/`latest`); the legacy `ghcr.io/opensecretcloud/maple-proxy`
+> publisher is disabled.
 >
-> **Our deployment is the last standalone release, v0.3.2 + `audio-endpoints.patch`,
-> and that is still correct.** The audio routes are absent from the monorepo
-> proxy too — its route table is unchanged (`/v1/models`, `/v1/chat/completions`,
-> `/v1/embeddings` only) — so the patch is still required, and it **applies clean
-> to `proxy/` at 0.4.1** (verified 2026-10-02). Re-basing onto 0.4.x is a
-> deliberate follow-up, not done yet; upstream's own guidance is to keep a
-> deployment on its working image until a replacement is published *and* verified.
+> **We are now on 0.4.1**, pinned to monorepo commit
+> `312d6c718e088a3af120677e553df1b69b141b31` (the latest commit touching
+> `proxy/`, 2026-09-22). The audio routes are still absent there, so
+> `audio-endpoints.patch` is still required and still applies clean to
+> `proxy/src/lib.rs` (verified 2026-10-02). The old `0.3.2-audio` image stays
+> imported as the rollback.
 
-`maple-proxy` (10.44.0.22:8080) runs upstream v0.3.2 plus
+`maple-proxy` (10.44.0.22:8080) runs upstream Maple proxy plus
 `audio-endpoints.patch` (2 router lines): the stock proxy 404s
 `/v1/audio/speech` and `/v1/audio/transcriptions`, but the opensecret crate and
 the enclave support both. Home Assistant's maple_tts/maple_stt components and
 ourtranslate's voice path depend on these routes.
 
 **The patch is not optional and it is not a nicety.** Stock upstream has never
-routed audio at *any* version — 0.1.8, 0.1.11, 0.3.2 and master all have the
-same five-route table with no fallback, and 0.3.2 added a test
-(`routes_outside_the_explicit_proxy_surface_are_not_forwarded`) that asserts
-`/v1/audio/speech` returns 404. The handler is path-generic: it takes
-`OriginalUri` and forwards it verbatim, and the SDK's
+routed audio at *any* version — 0.1.8, 0.1.11, 0.3.2 and the 0.4.1 monorepo all
+have the same route table with no fallback. The handler is path-generic: it
+takes `OriginalUri` and forwards it verbatim, and the SDK's
 `is_allowed_inference_endpoint` already whitelists both audio paths. Routing
 them is the whole fix.
 
@@ -46,34 +42,61 @@ all keep it. Do not go back to pushing a binary into a running container.
 
 ## Build
 
-Upstream's own Dockerfile, so the runtime base stays `debian:bookworm-slim`
-(glibc 2.36) — do not build the binary on a newer-glibc host and copy it in.
+[`build-image.sh`](build-image.sh) does a full no-docker rebuild on
+ubuntu-server (dockerd is disabled by design; containerd is the runtime),
+mirroring upstream's Dockerfile in two chroot stages:
 
-    git clone --depth 1 --branch v0.3.2 https://github.com/OpenSecretCloud/maple-proxy
-    cd maple-proxy && git apply /path/to/audio-endpoints.patch
-    docker build -t maple-proxy:0.3.2-audio .
-    docker save maple-proxy:0.3.2-audio -o mp-audio.tar   # -> ubuntu-server
+1. builder `docker.io/library/rust:1.89.0-bookworm` — install `pkg-config
+   libssl-dev`, apply `audio-endpoints.patch` inside `proxy/`,
+   `cargo build --locked --release --bin maple-proxy`;
+2. runtime `docker.io/library/debian:bookworm-slim` — `ca-certificates libssl3
+   curl`, a `maple` user (uid 1001), the binary at `/usr/local/bin/maple-proxy`.
 
-The retired-repo clone above still works for v0.3.2. For a 0.4.x re-base, clone
-the monorepo instead (`git clone --depth 1 https://github.com/MaplePrivacyLabs/Maple`),
-apply the patch under `proxy/`, and build with the monorepo proxy's own
-Dockerfile.
+Only `proxy/{Cargo.toml,Cargo.lock,src}` are used (`maple-sdk` comes from
+crates.io); **`rust-toolchain.toml` is deliberately not copied**, so the
+builder image's pinned 1.89.0 is used exactly as upstream's Dockerfile does.
+The runtime base stays `debian:bookworm-slim` (glibc 2.36) — do not build the
+binary on a newer-glibc host and copy it in.
 
-On ubuntu-server (dockerd is stopped by design; containerd is the runtime):
+    # on ubuntu-server, as root; SRC is a monorepo checkout at the pinned SHA
+    SRC=/root/build/maple-proxy-0.4.1-audio/src \
+      /path/to/build-image.sh          # imports docker.io/kata/maple-proxy-0.4.1-audio:migrated
 
-    ctr -n default images import /tmp/mp-audio.tar
-    ctr -n default images tag docker.io/library/maple-proxy:0.3.2-audio \
-                              docker.io/kata/maple-proxy-0.3.2-audio:migrated
-    systemctl restart kata-maple-proxy
+### 0.4.x notes
+
+- **`MAPLE_CACHE_NAMESPACE_ROOT` is deliberately NOT set.** It is a
+  client-side *secret* that stabilises Tinfoil provider-cache entries across
+  restarts. Omitting it is safe — the proxy generates a per-process root and
+  requests still work; only cross-restart cache hits are lost. It must not go
+  in `/etc/kata/env/maple-proxy.env`: the Kata runtime-rs shim writes the full
+  env to journald at every container start. If persistence is ever wanted, it
+  needs a secret-delivery path other than `--env-file`.
+- **Transport V2.** 0.4.x drops the V1 fallback, so it requires a V2-capable
+  enclave. The chat/embeddings smoke test after the switch is mandatory; if the
+  production enclave does not accept it, roll back immediately.
+- `MAPLE_ENABLE_CORS` defaults to false in 0.4.x; our env file sets it to `true`
+  explicitly, so the default change is inert.
+
+## Deploy
 
 The image ref is generated from `incus/containers.tsv` column 2 in
-sovtech/platform (`maple-proxy-0.3.2-audio`); change it there, not by hand
-in the unit. Rollback: set the column back to `maple-proxy-0.3.2` (stock, still
-imported, audio 404s) and restart. `ctr` renders the hyphen in a ref as a space
-in its own output — never parse that output for a ref.
+sovtech/platform (`maple-proxy-0.4.1-audio`); change it there, not by hand in
+the unit. A version change is the "new alias" pattern:
 
-Note the patch makes upstream's `routes_outside_...` test fail by design;
-`cargo build` (what the Dockerfile runs) is unaffected.
+    sudo git -C /opt/sovtech-infra pull
+    sudo /opt/sovtech-infra/kata/gen-kata-units.sh /tmp/u
+    diff /tmp/u/kata-maple-proxy.service /etc/systemd/system/kata-maple-proxy.service
+    sudo /opt/sovtech-infra/kata/gen-kata-units.sh --install
+    sudo systemctl restart kata-maple-proxy
+
+**Rollback.** The previous image stays imported as
+`docker.io/kata/maple-proxy-0.3.2-audio:migrated`. Quick rollback (keeps the
+unit on the new alias): `ctr -n default image tag --force
+docker.io/kata/maple-proxy-0.3.2-audio:migrated
+docker.io/kata/maple-proxy-0.4.1-audio:migrated` and restart. Clean rollback:
+revert the tsv row, pull, `gen-kata-units.sh --install`, restart. `ctr` renders
+the hyphen in a ref as a space in its own output — never parse that output for
+a ref.
 
 ## Contract
 
