@@ -149,6 +149,12 @@ process or network at all.
 
 ## Deploys
 
+- **2026-10-02 — Transport V2 raw-audio handling.** Full base rebuild by
+  `build-image.sh`, imported as `docker.io/kata/host-maple-shim:rawaudio` and
+  retagged `:migrated` (`sha256:fc43a1a2…`). Rollback:
+  `ctr -n default image tag --force docker.io/kata/host-maple-shim:pre-rawaudio
+  docker.io/kata/host-maple-shim:migrated`, then restart
+  (`:pre-rawaudio` = `sha256:4cba4834…`, the nearest-reset build).
 - **2026-10-02 — nearest-reset selection.** Full base rebuild from
   `python:3.14-slim` (index `sha256:0741d101…`, Python 3.14.8) by
   `build-image.sh`, imported as `docker.io/kata/host-maple-shim:nearest-reset`

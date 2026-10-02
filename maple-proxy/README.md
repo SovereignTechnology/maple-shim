@@ -98,6 +98,15 @@ revert the tsv row, pull, `gen-kata-units.sh --install`, restart. `ctr` renders
 the hyphen in a ref as a space in its own output — never parse that output for
 a ref.
 
+## Deploys
+
+- **2026-10-02 — 0.4.1-audio.** Built from monorepo `312d6c71` by
+  `build-image.sh`, imported `docker.io/kata/maple-proxy-0.4.1-audio:migrated`
+  (`sha256:b6831c73…`), containers.tsv row switched (sovtech/platform !33).
+  Transport V2 returns raw audio (no base64 envelope), which required a
+  maple-shim fix the same day. Rollback: `maple-proxy-0.3.2-audio:migrated`.
+- **2026-09-02 — 0.3.2-audio.** Patched 0.3.2 (`sha256:b953e868…`).
+
 ## Contract
 
 Both endpoints are JSON-in/JSON-out with the audio base64 inside the JSON —
