@@ -37,7 +37,7 @@ cd "$W"
 echo "== 0. base image $BASE_NAME:$BASE_TAG"
 if [ -z "$BASE_DIGEST" ]; then
     ctr -n default image pull --platform linux/amd64 "$BASE_NAME:$BASE_TAG" >/dev/null
-    BASE_DIGEST=$(ctr -n default image ls | awk -v n="$BASE_NAME:$BASE_TAG" '$1==n {print $3; exit}')
+    BASE_DIGEST=$(ctr -n default image ls | awk -v n="$BASE_NAME:$BASE_TAG" '$1==n {print $3}')
 fi
 [ -n "$BASE_DIGEST" ] || { echo "!! could not resolve $BASE_NAME:$BASE_TAG digest" >&2; exit 1; }
 echo "   $BASE_NAME@$BASE_DIGEST"
