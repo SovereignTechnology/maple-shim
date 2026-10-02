@@ -1,5 +1,21 @@
 # maple-proxy: audio endpoint patch (patched binary 2026-08-22, baked into an image 2026-09-02)
 
+> **Upstream status (checked 2026-10-02).** The standalone
+> `OpenSecretCloud/maple-proxy` repo was **retired on 2026-09-08**; development
+> moved to [`MaplePrivacyLabs/Maple`, `proxy/`](https://github.com/MaplePrivacyLabs/Maple/tree/master/proxy),
+> now at **0.4.1**. Replacement images publish to
+> `ghcr.io/mapleprivacylabs/maple-proxy` (tags `0.4.0`/`latest`); the legacy
+> `ghcr.io/opensecretcloud/maple-proxy` publisher is disabled, so its `latest`
+> no longer tracks new releases.
+>
+> **Our deployment is the last standalone release, v0.3.2 + `audio-endpoints.patch`,
+> and that is still correct.** The audio routes are absent from the monorepo
+> proxy too — its route table is unchanged (`/v1/models`, `/v1/chat/completions`,
+> `/v1/embeddings` only) — so the patch is still required, and it **applies clean
+> to `proxy/` at 0.4.1** (verified 2026-10-02). Re-basing onto 0.4.x is a
+> deliberate follow-up, not done yet; upstream's own guidance is to keep a
+> deployment on its working image until a replacement is published *and* verified.
+
 `maple-proxy` (10.44.0.22:8080) runs upstream v0.3.2 plus
 `audio-endpoints.patch` (2 router lines): the stock proxy 404s
 `/v1/audio/speech` and `/v1/audio/transcriptions`, but the opensecret crate and
@@ -37,6 +53,11 @@ Upstream's own Dockerfile, so the runtime base stays `debian:bookworm-slim`
     cd maple-proxy && git apply /path/to/audio-endpoints.patch
     docker build -t maple-proxy:0.3.2-audio .
     docker save maple-proxy:0.3.2-audio -o mp-audio.tar   # -> ubuntu-server
+
+The retired-repo clone above still works for v0.3.2. For a 0.4.x re-base, clone
+the monorepo instead (`git clone --depth 1 https://github.com/MaplePrivacyLabs/Maple`),
+apply the patch under `proxy/`, and build with the monorepo proxy's own
+Dockerfile.
 
 On ubuntu-server (dockerd is stopped by design; containerd is the runtime):
 
