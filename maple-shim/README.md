@@ -147,6 +147,19 @@ is deterministic on any day, and test 7 covers the nearest-reset selection.
 wins, a latched or cooled tier sorts last, `TIER_ORDER` tie-breaks), with no
 process or network at all.
 
+## Deploys
+
+- **2026-10-02 — nearest-reset selection.** Full base rebuild from
+  `python:3.14-slim` (index `sha256:0741d101…`, Python 3.14.8) by
+  `build-image.sh`, imported as `docker.io/kata/host-maple-shim:nearest-reset`
+  and retagged `:migrated` (`sha256:4cba4834…`). Rollback:
+  `ctr -n default image tag --force docker.io/kata/host-maple-shim:pre-nearest-reset
+  docker.io/kata/host-maple-shim:migrated`, then restart. Verified `/health`
+  `active_tier: pro` and a real chat call served by Pro.
+- **2026-09-25 — failover detection.** One-layer rebuild over the running
+  image, imported `:failover` then retagged `:migrated` (`sha256:ea252f30…`).
+  Rollback `:pre-failover`.
+
 ## Notification
 
 booty polls `/health` every 2 minutes (`maple-tier-watch.timer`) and sends a
