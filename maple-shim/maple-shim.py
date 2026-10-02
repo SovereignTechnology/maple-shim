@@ -33,9 +33,13 @@ Three jobs in a single process, because they all need the same credential:
      early is safe -- their reset timezone need not be ours, and the next call
      simply 403s and re-latches, costing one wasted round trip a month.
 
-  3. Audio translation, the shim's original job: the enclave's audio endpoints
-     are JSON-in/JSON-out with base64 audio, which stock OpenAI clients cannot
-     speak.
+  3. Audio translation, the shim's original job: the enclave used to answer its
+     audio endpoints as JSON with base64 audio, which stock OpenAI clients
+     cannot speak. Maple 0.4.x / Transport V2 now answers /audio/speech with the
+     raw bytes, honouring response_format, so the shim relays that directly --
+     and re-wraps it in the legacy {content_base64, content_type} envelope for
+     native-audio clients (Home Assistant's maple_tts), which do their own
+     base64 decode.
 
 Chat completions are SSE, so responses are relayed chunk by chunk under chunked
 transfer encoding. The previous buffered resp.read() was correct for a one-shot
@@ -748,12 +752,32 @@ class Handler(BaseHTTPRequestHandler):
         with resp:
             raw = resp.read()
             upstream_type = resp.headers.get("Content-Type", "application/json")
+        if upstream_type.split(";")[0].strip() != "application/json":
+            # Maple 0.4.x / Transport V2 returns the audio directly, honouring
+            # response_format; the legacy {content_base64, content_type}
+            # envelope is gone (response_format:"json" now 500s). Relay it.
+            if native:
+                # Home Assistant's maple_tts does its own base64 decode and
+                # cannot parse raw audio, so re-wrap the bytes in the envelope
+                # it expects.
+                self._reply(
+                    200,
+                    json.dumps(
+                        {
+                            "content_base64": base64.b64encode(raw).decode(),
+                            "content_type": upstream_type,
+                        }
+                    ).encode(),
+                    "application/json",
+                )
+            else:
+                self._reply(200, raw, upstream_type)
+            return
+        # Legacy V1 contract: {content_base64, content_type}.
+        data = json.loads(raw)
         if native:
-            # Hand back the enclave's JSON verbatim; the caller does its own
-            # base64 decode. Key injection and quota failover still applied.
             self._reply(200, raw, upstream_type)
             return
-        data = json.loads(raw)
         audio = base64.b64decode(data["content_base64"])
         self._reply(200, audio, data.get("content_type", "audio/mpeg"))
 

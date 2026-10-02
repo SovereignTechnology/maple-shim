@@ -181,7 +181,11 @@ ubuntu-server.
 - `POST /v1/embeddings`
 - `POST /v1/audio/speech` — OpenAI TTS request in, raw audio bytes out. Forces
   model `voxtral-tts`; maps OpenAI voice names (alloy, nova, ...) to Maple
-  voices; native Maple voice names pass through.
+  voices; native Maple voice names pass through. Maple 0.4.x / Transport V2
+  answers with the audio directly, honouring `response_format` (`audio/mpeg`,
+  `audio/wav`, ...), and the shim relays it. A legacy `{content_base64,
+  content_type}` JSON body is still decoded, so the shim works against both
+  proxy generations.
 - `POST /v1/audio/transcriptions` — OpenAI multipart in, OpenAI JSON out.
   Forces `whisper-large-v3`. A JSON body is passed through as the native Maple
   contract instead.
@@ -197,12 +201,13 @@ makes every audio call here fail with a relayed 404, while chat keeps working.
 
 A third-and-later field on a `tokens` line is a flag for that client.
 
-- `native-audio` — return the enclave's audio JSON (`{content_base64,
-  content_type}`) verbatim instead of decoding it to raw bytes. Home
-  Assistant's `maple_tts` does its own base64 decode and cannot parse raw
-  audio, so this is what let it move off a raw Maple key onto a token without
-  touching the component. `X-Maple-Native-Audio: 1` does the same per request.
-  Key injection, quota failover and the latch all still apply.
+- `native-audio` — re-wrap the audio in the legacy `{content_base64,
+  content_type}` JSON envelope that Home Assistant's `maple_tts` expects (it
+  does its own base64 decode and cannot parse raw audio). Maple 0.4.x no longer
+  emits that envelope itself, so the shim synthesises it from the raw bytes;
+  against a legacy proxy that still returns the envelope, it passes it through.
+  `X-Maple-Native-Audio: 1` does the same per request. Key injection, quota
+  failover and the latch all still apply.
 
 ## Clients
 
