@@ -99,10 +99,28 @@ embed() { curl -sS -m 5 -o /dev/null -w '%{http_code}' \
   http://127.0.0.1:9176/v1/embeddings -d '{"model":"nomic-embed-text","input":"x"}'; }
 latched() { python3 -c 'import json,sys;print("yes" if (json.load(open(sys.argv[1])).get(sys.argv[2]) or {}).get("exhausted_at") else "no")' "$t/state.json" "$1" 2>/dev/null || echo missing; }
 
+# Pin the reset days so tier ordering is deterministic whatever day the suite
+# runs on: RD_NEAR is ~1 day out, RD_FAR ~15, both clamped to 1..28.
+read -r RD_NEAR RD_FAR < <(python3 - <<'PY'
+import datetime as d
+t = d.date.today()
+near = (t + d.timedelta(days=1)).day
+near = near if near <= 28 else 1
+far = (t + d.timedelta(days=15)).day
+far = far if far <= 28 else 1
+if far == near:
+    far = 1 if near != 1 else 2
+print(near, far)
+PY
+)
+
+# T_MAX/T_PRO override the reset days for a scenario; the default puts Max
+# nearest, which is what the failover cases below assume.
 start_shim() {
   MAPLE_UPSTREAM=http://127.0.0.1:9099/v1 BIND=127.0.0.1 PORT=9176 \
   MAPLE_SHIM_STRICT=1 MAPLE_TOKENS="$t/tokens" STATE_DIRECTORY="$t" \
   CREDENTIALS_DIRECTORY="$t" MAPLE_COOLDOWN_SECONDS=900 \
+  MAPLE_RESET_DAY_MAX="${T_MAX:-$RD_NEAR}" MAPLE_RESET_DAY_PRO="${T_PRO:-$RD_FAR}" \
   python3 "$SHIM" >"$t/shim.log" 2>&1 & SHIM_PID=$!; sleep 1
 }
 stop_shim() { kill $SHIM_PID 2>/dev/null; wait $SHIM_PID 2>/dev/null; SHIM_PID=; }
@@ -147,7 +165,7 @@ c=$(chat)
 stop_shim
 
 # 4c/4d -- /v1/embeddings also answers on a spent plan. With BOTH tiers latched (month's end)
-# the shim tries Max first (stable order), and a 200 there must not clear its latch.
+# the shim tries Max first (nearer reset here), and a 200 there must not clear its latch.
 rm -f "$t/state.json"; setb 'max_status=403' 'pro_status=403'; start_shim
 chat >/dev/null
 e=$(embed)
@@ -160,6 +178,16 @@ rm -f "$t/state.json"; setb 'max_status=401' 'pro_status=401'; start_shim
 c=$(chat)
 [ "$c" = 401 ] && ok "6a both refuse -> upstream status relayed" || no "6a both refuse -> upstream status relayed" "got $c"
 grep -q "every tier refused" "$t/shim.log" && ok "6b 'every tier refused' logged" || no "6b 'every tier refused' logged" "silent"
+stop_shim
+
+# 7 -- selection is by nearest reset, not a fixed Max. Flip the reset days so Pro
+# is nearer and both answer: Pro must serve and Max must never be tried.
+rm -f "$t/state.json"; setb 'max_status=200' 'pro_status=200'; T_MAX=$RD_FAR T_PRO=$RD_NEAR start_shim
+c=$(chat)
+[ "$c" = 200 ] && ok "7a nearest-reset tier served first -> 200" || no "7a nearest-reset tier served first -> 200" "got $c"
+grep -q '"served_by": *"pro"' "$t/out.json" && ok "7b Pro (nearer reset) served" || no "7b Pro (nearer reset) served" "not Pro"
+python3 -c 'import json,os,sys;p=sys.argv[1];m=(json.load(open(p)).get("max") or {}) if os.path.exists(p) else {};sys.exit(0 if not m.get("last_error") else 1)' "$t/state.json" \
+  && ok "7c Max untouched (never tried)" || no "7c Max untouched (never tried)" "Max was tried"
 stop_shim
 
 echo; echo "PASS=$pass FAIL=$fail"

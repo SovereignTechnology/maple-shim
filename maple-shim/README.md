@@ -7,15 +7,20 @@ the Max and Pro plans.
 - Runs as the Kata VM `maple-shim` on **10.44.0.64:8176** (2026-08-30 cutover;
   `kata/host-workloads.tsv` in sovtech/platform). The script lives in the
   image built from this directory's `Dockerfile` — editing
-  `/usr/local/bin/maple-shim.py` on the host now changes nothing. Rebuild,
-  `ctr images import`, retag `docker.io/kata/host-maple-shim:migrated`, then
-  `systemctl restart kata-maple-shim`.
-  **No docker is needed (dockerd stays disabled on ubuntu-server):** the 2026-09-25 deploy of
-  !9 built the image as the RUNNING image plus ONE layer carrying `maple-shim.py`, config and
-  command unchanged, imported as `:failover` and retagged `:migrated`
-  (`sha256:ea252f30…`). Rollback: `ctr images tag --force docker.io/kata/host-maple-shim:pre-failover
-  docker.io/kata/host-maple-shim:migrated` and restart. Build dir `/root/build/maple-shim-<ts>/`. `keys.env` and `tokens` are bind-mounted
-  from the host, so the image still holds no secret.
+  `/usr/local/bin/maple-shim.py` on the host now changes nothing.
+  **No docker is needed (dockerd stays disabled on ubuntu-server):**
+  [`build-image.sh`](build-image.sh) does a full base rebuild — it pulls
+  `python:3.14-slim`, adds `maple-shim.py`, squashes the rootfs to ONE OCI
+  layer, writes the OCI layout by hand and `ctr images import`s it (the
+  ci-runner method). Run it as root on ubuntu-server. `keys.env` and `tokens`
+  are bind-mounted from the host, so the image holds no secret.
+  Deploy: run `build-image.sh` (imports `docker.io/kata/host-maple-shim:<tag>`),
+  snapshot the rollback (`ctr -n default image tag docker.io/kata/host-maple-shim:migrated
+  docker.io/kata/host-maple-shim:pre-<change>`), retag the new build
+  (`ctr -n default image tag --force docker.io/kata/host-maple-shim:<tag>
+  docker.io/kata/host-maple-shim:migrated`), then `systemctl restart kata-maple-shim`.
+  Rollback: retag `:pre-<change>` back to `:migrated` and restart. (The 2026-09-25
+  deploy used the earlier one-layer method; its rollback is `:pre-failover`.)
 - Published on the tailnet by Caddy as `https://100.64.0.11:62054`
   (`caddy/services.tsv` in sovtech/platform, row `maple-shim`; auburn-cowboys Local Root CA).
 
@@ -56,7 +61,16 @@ that is the whole point of the token indirection.
 
 ## Quota failover
 
-Max is used until it stops serving, then Pro.
+The healthy tier whose quota **resets soonest** is used, so the balance that is
+about to expire is spent before one that was just refreshed. Max resets on the
+**1st** and Pro on the **15th**: on the 2nd of a month Pro is nearer (the 15th
+vs the 1st of next month), on the 20th Max is (the 1st vs the 15th). The order is
+recomputed on every request, so it flips by itself at each reset. A tier that is
+latched or cooling down is still ranked below a healthy one.
+
+The reset days are overridable with `MAPLE_RESET_DAY_MAX` / `MAPLE_RESET_DAY_PRO`
+(default `1` / `15`, valid `1`–`28`); a bad value is logged and ignored. Each
+tier's upcoming `next_reset` is reported by `/health`.
 
 **Failing over and latching are separate decisions, and that separation is the
 whole design.** *Any* refusal moves to the next tier. Only a refusal we can
@@ -96,10 +110,11 @@ soon, and never described as "exhausted".
 
 ### Ordering and self-healing
 
-`_tier_order()` ranks tiers healthy → cooling down → latched, and the sort is
-stable, so equal-health tiers keep `TIER_ORDER` and Max stays preferred over Pro.
-Every configured tier is still *attempted*, so a stale latch or cooldown heals
-itself rather than locking you out.
+`_tier_order()` ranks tiers healthy → cooling down → latched, then prefers the
+soonest-to-reset among equal health. `TIER_ORDER` is only the stable tie-break
+for two tiers that reset on the same day. Every configured tier is still
+*attempted*, so a stale latch or cooldown heals itself rather than locking you
+out.
 
 Max resets on the **1st**, Pro on the **15th**, so a latch is not a timer: it
 expires at the next occurrence of its own reset day. A latch cleared too early
@@ -125,7 +140,12 @@ is committed to its tier.
 `./tests-failover.sh` runs the real script against a stub enclave on loopback
 with fake keys — no credentials, no network, no fleet access. It covers all of
 the above, including the 401 case verbatim. Against the pre-2026-09-20 code it
-fails 12 of 14.
+fails 12 of 14. It pins the reset days through the environment so the ordering
+is deterministic on any day, and test 7 covers the nearest-reset selection.
+
+`python3 test_order.py` unit-tests the selection rule directly (nearest reset
+wins, a latched or cooled tier sorts last, `TIER_ORDER` tie-breaks), with no
+process or network at all.
 
 ## Notification
 

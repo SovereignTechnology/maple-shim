@@ -11,9 +11,11 @@ Three jobs in a single process, because they all need the same credential:
      LoadCredential, so only this service can read them -- there is no
      group-readable copy sitting on disk.
 
-  2. Quota failover. Max is used until it stops serving, then Pro. ANY refusal
-     moves to the next tier; only a recognised quota signal writes an
-     exhaustion latch. The two are separate on purpose, because the enclave
+  2. Quota failover. The healthy tier whose quota resets soonest is used, so
+     the balance about to expire is spent before one that was just refreshed
+     (Max resets on the 1st, Pro on the 15th). ANY refusal moves to the next
+     tier; only a recognised quota signal writes an exhaustion latch. The two
+     are separate on purpose, because the enclave
      does not always say why it is refusing. Measured 2026-09-20: a spent Max
      plan refuses /v1/chat/completions with a bare 401 Unauthorized, while
      /v1/models and /v1/embeddings keep answering on the same key. A 401 is
@@ -79,8 +81,29 @@ TOKENS_FILE = os.environ.get("MAPLE_TOKENS", "/etc/maple-shim/tokens")
 STATE_DIR = os.environ.get("STATE_DIRECTORY", "/var/lib/maple-shim")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 
-# Day of the month on which each plan's quota resets.
-RESET_DAY = {"max": 1, "pro": 15}
+# Day of the month on which each plan's quota resets. Overridable through the
+# environment so a plan whose reset day changes -- or a test that needs a
+# deterministic order -- does not require a code edit. Restricted to 1..28 so
+# the date is always real in every month; anything else falls back loudly.
+def _reset_day(tier: str, default: int) -> int:
+    raw = os.environ.get(f"MAPLE_RESET_DAY_{tier.upper()}")
+    if raw is None:
+        return default
+    try:
+        day = int(raw)
+    except ValueError:
+        day = 0
+    if not 1 <= day <= 28:
+        print(
+            f"maple-shim: ignoring bad MAPLE_RESET_DAY_{tier.upper()}={raw!r}; "
+            f"using {default}",
+            file=sys.stderr,
+        )
+        return default
+    return day
+
+
+RESET_DAY = {"max": _reset_day("max", 1), "pro": _reset_day("pro", 15)}
 TIER_ORDER = ("max", "pro")
 
 # Substrings that identify a spent plan in an upstream 403 body. 403 is
@@ -281,13 +304,19 @@ def _latched(tier: str, state: dict, now: datetime) -> bool:
     return now < _next_reset(when, RESET_DAY[tier])
 
 
-def _tier_order(state: dict) -> list:
+def _tier_order(state: dict, now: datetime | None = None) -> list:
     """Healthy tiers first, then ones serving a cooldown, then ones known to be
     spent -- but every configured tier is still attempted rather than refused
     outright. If a latch or a cooldown is stale the request succeeds and clears
-    it; if it is not, the refusal comes straight back. The sort is stable, so
-    tiers of equal health keep TIER_ORDER and Max stays preferred over Pro."""
-    now = datetime.now()
+    it; if it is not, the refusal comes straight back.
+
+    Among equally-healthy tiers the one whose quota resets SOONEST is preferred,
+    so the balance that is about to expire is spent before one that was just
+    refreshed. That is why this is not a fixed Max-then-Pro: on the 2nd of a
+    month Pro (resets the 15th) is nearer than Max (resets the 1st of next
+    month), and on the 20th it is the other way round. TIER_ORDER is only the
+    stable tie-break for two tiers that reset on the same day."""
+    now = now or datetime.now()
 
     def rank(tier: str) -> int:
         if _latched(tier, state, now):
@@ -296,7 +325,10 @@ def _tier_order(state: dict) -> list:
             return 1
         return 0
 
-    return sorted((t for t in TIER_ORDER if KEYS.get(t)), key=rank)
+    return sorted(
+        (t for t in TIER_ORDER if KEYS.get(t)),
+        key=lambda t: (rank(t), _next_reset(now, RESET_DAY[t])),
+    )
 
 
 def _set_latch(tier: str, exhausted: bool):
@@ -615,6 +647,9 @@ class Handler(BaseHTTPRequestHandler):
                 # unlatched tier showing a stale exhausted_at beside a null
                 # resets reads as a live problem that has already cleared.
                 "resets": resets,
+                # The next reset this tier will actually get, always present, so
+                # the preference (soonest reset wins) is visible in /health.
+                "next_reset": _next_reset(now, RESET_DAY[tier]).isoformat(),
                 "cooling_down": _cooled(tier, state, now),
                 "cooldown_until": entry.get("cooldown_until"),
                 "last_error": entry.get("last_error"),
