@@ -43,7 +43,7 @@ fi
 echo "   $BASE_NAME@$BASE_DIGEST"
 
 echo "== 1. export base rootfs"
-ctr -n default image export --platform linux/amd64 base.tar "$BASE_NAME@$BASE_DIGEST"
+ctr -n default image export --platform linux/amd64 base.tar "$BASE_NAME:$BASE_TAG"
 tar -C base -xf base.tar
 resolve() { # index -> (nested index) -> amd64 manifest blob path
     local d=$1 mt
