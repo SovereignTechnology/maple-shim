@@ -40,7 +40,15 @@ done
 case "$W" in /root/build/?*) ;; *) echo "!! W must be under /root/build/ (got '$W')" >&2; exit 1 ;; esac
 case "$W" in *..*) echo "!! W must not contain '..'" >&2; exit 1 ;; esac
 umask 022
-rm -rf "$W"; mkdir -p "$W/oci/blobs/sha256" "$W/build/proxy"
+# A run that died between a /dev bind below and its umount (SIGKILL skips the EXIT trap) leaves the
+# host /dev mounted under $W, and rm -rf would then unlink host device nodes (/dev/kvm, /dev/null...).
+# So the whole build runs in a private mount namespace -- its mounts die with it and no other run sees
+# them -- and refuses to start while anything older is still mounted under $W.
+[ -n "${BUILD_IMAGE_NS:-}" ] || exec unshare -m --propagation private env BUILD_IMAGE_NS=1 "$0" "$@"
+if awk -v w="$W/" 'index($5, w) == 1 {f = 1} END {exit !f}' /proc/self/mountinfo; then
+    echo "!! something is still mounted under $W -- unmount it first" >&2; exit 1
+fi
+rm -rf --one-file-system "$W"; mkdir -p "$W/oci/blobs/sha256" "$W/build/proxy"
 
 resolve() { # index -> (nested index) -> amd64 manifest blob path
     local d=$1 mt
