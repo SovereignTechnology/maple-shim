@@ -1,5 +1,7 @@
 # maple-shim
 
+> **Source of truth:** [`nostr://npub1s0vtechh66tx7vrwdud8zfyheu9zca7swwfrzd4qu2a4f93mxs6qvn9adx/git.sovit.xyz/maple-shim`](https://gitworkshop.dev/npub1s0vtechh66tx7vrwdud8zfyheu9zca7swwfrzd4qu2a4f93mxs6qvn9adx/git.sovit.xyz/maple-shim) — issues and pull requests live there. This GitHub repository is a mirror; push to the Nostr remote, not here.
+
 The Maple access layer for the SovTech fleet: a single key broker that fails
 over between the two Maple plans (Max → Pro) and the patched proxy it fronts.
 
