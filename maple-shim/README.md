@@ -249,12 +249,19 @@ HA holds Maple credentials in **two** places, and both had the raw Pro key:
 - `secrets.yaml` → `maple_api_key`, used by `maple_tts` + `maple_stt`.
 - `.storage/core.config_entries` → the `llama_conversation` entry (a HACS
   component, "Generic OpenAI"), which is the LLM behind the **Maple** assist
-  pipeline (`stt=maple_stt`, `tts=maple_tts`, conversation = **`glm-5-3`**,
-  was `deepseek-v4-flash` until 2026-09-13). Restoring the audio routes alone
+  pipeline (`stt=maple_stt`, `tts=maple_tts`, conversation =
+  **`deepseek-v4-1-flash`** since 2026-10-29; `glm-5-3` 2026-09-13 → 10-29,
+  `deepseek-v4-flash` before that). Restoring the audio routes alone
   would have left the pipeline mute anyway, because its brain was 403ing.
 
 That entry is edited by stopping HA, rewriting the JSON, then starting it —
-HA rewrites `.storage` on shutdown, so editing it live loses the change. Note
+HA rewrites `.storage` on shutdown, so editing it live loses the change. Under
+Kata the stop has to be `systemctl stop kata-home-assistant`: the image's s6
+`finish` script halts the whole VM when HA core exits, so there is no window
+inside the guest. With the VM down the edit is host-side on a guest-writable
+volume, so open every path component `O_NOFOLLOW`, require a regular
+single-link file, and write a backup plus a temp file through the directory fd
+with `O_EXCL`, then rename (done that way 2026-10-29, ~85 s downtime). Note
 `port` is stored as a **string**: writing an int makes the component fail setup
 in `format_url` with no useful message.
 
@@ -300,3 +307,18 @@ Second-turn latency (the reply that gets spoken, median of 3):
 neither leaked reasoning at default settings. `glm-5-3` was chosen for the
 tightest spread. Note `glm-5-3-flash` exists on the enclave but postdates the
 2026-09-02 catalogue refresh in `opencode.jsonc`.
+
+**2026-10-29: switched to `deepseek-v4-1-flash`** (Cameron: "make the new
+deepseek the main one"). Re-measured from inside the HA guest with HA's own
+token, streamed like `llama_conversation` (`enable_streaming: true`), system
+prompt + `HassTurnOn`/`HassTurnOff`/`GetLiveContext` tools, full two-turn round
+trip, 3 runs each:
+
+| model | state question | turn-on command | tool calls | reasoning in `content` | max completion tokens |
+|---|---|---|---|---|---|
+| `glm-5-3` | 11.8 s [10.9–21.1] | 16.8 s [5.4–27.4] | well-formed | none | 208 |
+| `deepseek-v4-1-flash` | 0.8 s [0.6–1.6] | 1.6 s [1.3–1.8] | well-formed | none (0 reasoning chars streamed) | 44 |
+
+`max_new_tokens` stays 512 (>10× headroom). The entity_id rule above still
+holds: it is still `conversation.deepseek_v4_flash_deepseek_v4_flash`, which by
+coincidence now names roughly the right model again.
