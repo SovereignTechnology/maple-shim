@@ -1,22 +1,25 @@
 #!/bin/bash
-# Build docker.io/kata/maple-proxy-0.4.1-audio:migrated -- upstream Maple proxy
-# 0.4.1 plus audio-endpoints.patch, which routes /v1/audio/speech and
-# /v1/audio/transcriptions (stock upstream 404s both at every version).
+# Build docker.io/kata/maple-proxy-<ver>-audio:migrated -- upstream Maple proxy
+# <ver> (read from the source's proxy/Cargo.toml) plus audio-endpoints.patch,
+# which routes /v1/audio/speech and /v1/audio/transcriptions (stock upstream
+# 404s both at every version).
 #
 # Full rebuild from source, no dockerd (it is disabled on ubuntu-server by
 # design; containerd is the runtime). Two chroot stages mirror the upstream
 # Dockerfile: rust:1.89.0-bookworm builds the binary, debian:bookworm-slim is
 # the runtime. Method mirrors sovtech-ubuntu-server/ci-runner/build-image.sh.
 #
-# Source is the Maple monorepo proxy/, pinned by SHA in the README. Only
-# proxy/{Cargo.toml,Cargo.lock,src} are used (maple-sdk comes from crates.io),
-# and rust-toolchain.toml is deliberately NOT copied, so the builder image's
-# pinned 1.89.0 is used exactly as upstream's Dockerfile does.
+# Source is the Maple monorepo, pinned by SHA in the README. Staged exactly as
+# upstream's proxy/Dockerfile COPYs it: proxy/{Cargo.toml,Cargo.lock,src} and,
+# since 0.4.2, the in-tree SDK sdk/rust/{Cargo.toml,src,assets} (proxy's
+# Cargo.toml patches maple-sdk to path ../sdk/rust). rust-toolchain.toml is
+# deliberately NOT copied, so the builder image's pinned 1.89.0 is used exactly
+# as upstream's Dockerfile does.
 #
 # usage: build-image.sh [--no-import]      run as root on ubuntu-server
 #   SRC=/path/to/monorepo    dir containing proxy/  (required)
-#   BUILDER_DIGEST=sha256:...  pin rust:1.89.0-bookworm (default: resolve now)
-#   RUNTIME_DIGEST=sha256:...  pin debian:bookworm-slim
+#   BUILDER_DIGEST=sha256:...  pull rust:1.89.0-bookworm by this digest (default: the tag, now)
+#   RUNTIME_DIGEST=sha256:...  pull debian:bookworm-slim by this digest (default: the tag, now)
 #   OUT_TAG=migrated           tag to import
 set -euo pipefail
 
@@ -24,9 +27,7 @@ BUILDER_NAME=docker.io/library/rust
 BUILDER_TAG=1.89.0-bookworm
 RUNTIME_NAME=docker.io/library/debian
 RUNTIME_TAG=bookworm-slim
-OUT_NAME=docker.io/kata/maple-proxy-0.4.1-audio
 OUT_TAG=${OUT_TAG:-migrated}
-W=${W:-/root/build/maple-proxy-0.4.1-audio/image}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SRC=${SRC:-}
 
@@ -36,6 +37,21 @@ for t in ctr jq tar gzip sha256sum python3 git; do
 done
 [ -n "$SRC" ] && [ -d "$SRC/proxy/src" ] || { echo "!! SRC must point at a monorepo checkout containing proxy/ (got '$SRC')" >&2; exit 1; }
 [ -f "$HERE/audio-endpoints.patch" ] || { echo "!! missing $HERE/audio-endpoints.patch" >&2; exit 1; }
+# The version names the image; read it from [package], never trust a stale constant.
+VER=$(awk '/^\[/{p=($0=="[package]")} p && /^version *= *"/{gsub(/.*= *"|".*/,""); print; exit}' "$SRC/proxy/Cargo.toml")
+case "$VER" in [0-9]*.[0-9]*.[0-9]*) ;; *) echo "!! no [package] version in $SRC/proxy/Cargo.toml (got '$VER')" >&2; exit 1 ;; esac
+case "$VER" in *[!0-9.]*) echo "!! version '$VER' is not plain digits and dots" >&2; exit 1 ;; esac
+OUT_NAME=docker.io/kata/maple-proxy-$VER-audio
+W=${W:-/root/build/maple-proxy-$VER-audio/image}
+# 0.4.2+ build against the in-tree SDK; stage it when the manifest says so.
+SDK=no
+if grep -q '^maple-sdk *= *{ *path *= *"\.\./sdk/rust" *}' "$SRC/proxy/Cargo.toml"; then
+    for f in Cargo.toml src assets; do
+        [ -e "$SRC/sdk/rust/$f" ] || { echo "!! proxy patches maple-sdk to ../sdk/rust but $SRC/sdk/rust/$f is missing" >&2; exit 1; }
+    done
+    SDK=yes
+fi
+echo "== maple-proxy $VER (in-tree sdk: $SDK) -> $OUT_NAME:$OUT_TAG"
 
 case "$W" in /root/build/?*) ;; *) echo "!! W must be under /root/build/ (got '$W')" >&2; exit 1 ;; esac
 case "$W" in *..*) echo "!! W must not contain '..'" >&2; exit 1 ;; esac
@@ -48,7 +64,7 @@ umask 022
 if awk -v w="$W/" 'index($5, w) == 1 {f = 1} END {exit !f}' /proc/self/mountinfo; then
     echo "!! something is still mounted under $W -- unmount it first" >&2; exit 1
 fi
-rm -rf --one-file-system "$W"; mkdir -p "$W/oci/blobs/sha256" "$W/build/proxy"
+rm -rf --one-file-system "$W"; mkdir -p "$W/oci/blobs/sha256" "$W/build/proxy" "$W/build/sdk/rust"
 
 resolve() { # index -> (nested index) -> amd64 manifest blob path
     local d=$1 mt
@@ -66,9 +82,15 @@ digest_of() { # name:tag -> digest as ctr reports it (multi-arch index digest)
     ctr -n default image ls | awk -v n="$1:$2" '$1==n {print $3}'
 }
 
-export_base() { # name tag outdir
-    ctr -n default image pull --platform linux/amd64 "$1:$2" >/dev/null
-    ctr -n default image export --platform linux/amd64 base.tar "$1:$2"
+export_base() { # name tag outdir [digest] -- by digest when one is given, else by tag
+    local ref="$1:$2"
+    if [ -n "${4:-}" ]; then
+        case "$4" in sha256:[0-9a-f]*) ;; *) echo "!! digest '$4' is not sha256:<hex>" >&2; return 1 ;; esac
+        [ "${#4}" = 71 ] || { echo "!! digest '$4' is not 64 hex characters" >&2; return 1; }
+        ref="$1@$4"
+    fi
+    ctr -n default image pull --platform linux/amd64 "$ref" >/dev/null
+    ctr -n default image export --platform linux/amd64 base.tar "$ref"
     rm -rf "$3"; mkdir -p "$3"
     tar -C "$3" -xf base.tar
 }
@@ -76,7 +98,7 @@ export_base() { # name tag outdir
 # --------------------------------------------------------------------------- #
 echo "== 0. builder base $BUILDER_NAME:$BUILDER_TAG"
 cd "$W"
-export_base "$BUILDER_NAME" "$BUILDER_TAG" "$W/base"
+export_base "$BUILDER_NAME" "$BUILDER_TAG" "$W/base" "${BUILDER_DIGEST:-}"
 manifest=$(resolve "$(jq -r '.manifests[0].digest' base/index.json)")
 mkdir -p "$W/rootfs-builder"
 for l in $(jq -r '.layers[].digest' "$manifest"); do
@@ -90,8 +112,13 @@ cp "$SRC/proxy/Cargo.toml" "$SRC/proxy/Cargo.lock" "$W/build/proxy/"
 cp -a "$SRC/proxy/src" "$W/build/proxy/src"
 ( cd "$W/build/proxy" && git apply "$HERE/audio-endpoints.patch" )
 grep -q '/v1/audio/speech' "$W/build/proxy/src/lib.rs" || { echo "!! patch did not apply (no audio route in lib.rs)" >&2; exit 1; }
+if [ "$SDK" = yes ]; then
+    cp "$SRC/sdk/rust/Cargo.toml" "$W/build/sdk/rust/"
+    cp -a "$SRC/sdk/rust/src" "$SRC/sdk/rust/assets" "$W/build/sdk/rust/"
+fi
 mkdir -p "$W/rootfs-builder/build"
 cp -a "$W/build/proxy" "$W/rootfs-builder/build/proxy"
+[ "$SDK" = no ] || { mkdir -p "$W/rootfs-builder/build/sdk"; cp -a "$W/build/sdk/rust" "$W/rootfs-builder/build/sdk/rust"; }
 
 echo "== 2. chroot build (rust $BUILDER_TAG)"
 cp /etc/resolv.conf "$W/rootfs-builder/etc/resolv.conf"
@@ -117,7 +144,7 @@ echo "   built $(du -h "$BIN" | cut -f1) binary"
 
 # --------------------------------------------------------------------------- #
 echo "== 3. runtime base $RUNTIME_NAME:$RUNTIME_TAG"
-export_base "$RUNTIME_NAME" "$RUNTIME_TAG" "$W/base"
+export_base "$RUNTIME_NAME" "$RUNTIME_TAG" "$W/base" "${RUNTIME_DIGEST:-}"
 manifest=$(resolve "$(jq -r '.manifests[0].digest' base/index.json)")
 mkdir -p "$W/rootfs"
 for l in $(jq -r '.layers[].digest' "$manifest"); do
@@ -137,6 +164,9 @@ chroot "$W/rootfs" /usr/bin/env -i \
     /bin/sh -e <<'EOF'
 export DEBIAN_FRONTEND=noninteractive LC_ALL=C
 apt-get -q update
+# The base image lags the security pocket (perl-base, libbrotli1 and openssl
+# were all stale in the 0.4.1 build): upgrade it before adding anything.
+apt-get -q -y -o Dpkg::Options::=--force-confold upgrade
 apt-get -q -y --no-install-recommends install ca-certificates libssl3 curl
 rm -rf /var/lib/apt/lists/* /var/cache/apt/*.bin /var/log/apt /var/log/dpkg.log
 useradd -m -u 1001 -s /bin/bash maple
@@ -156,9 +186,9 @@ layer_size=$(stat -c %s "$W/layer.tar.gz")
 mv "$W/layer.tar.gz" "$W/oci/blobs/sha256/$layer_digest"
 
 echo "== 5. OCI layout"
-python3 - "$W" "$diff_id" "$layer_digest" "$layer_size" "$OUT_NAME" "$OUT_TAG" "$RUNTIME_DIGEST" <<'PY'
+python3 - "$W" "$diff_id" "$layer_digest" "$layer_size" "$OUT_NAME" "$OUT_TAG" "$RUNTIME_DIGEST" "$VER" <<'PY'
 import json, hashlib, sys
-W, diff_id, ldig, lsize, name, tag, base = sys.argv[1:]
+W, diff_id, ldig, lsize, name, tag, base, ver = sys.argv[1:]
 import datetime
 now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
 def blob(obj):
@@ -171,7 +201,7 @@ env = ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
        "MAPLE_BACKEND_URL=https://enclave.trymaple.ai",
        "MAPLE_PCR0_ENVIRONMENT=production","MAPLE_DEBUG=false",
        "MAPLE_ENABLE_CORS=true","MAPLE_REQUEST_TIMEOUT_SECS=300",
-       "MAPLE_STREAM_IDLE_TIMEOUT_SECS=300","RUST_LOG=info"]
+       "MAPLE_STREAM_IDLE_TIMEOUT_SECS=360","RUST_LOG=info"]
 config = {
   "architecture":"amd64","os":"linux","created":now,
   "config":{"Env":env,
@@ -179,7 +209,7 @@ config = {
             "WorkingDir":"/app","User":"maple",
             "ExposedPorts":{"8080/tcp":{}},
             "Labels":{"org.opencontainers.image.base.digest":base,
-                      "org.opencontainers.image.description":"maple-proxy 0.4.1 + audio-endpoints.patch",
+                      "org.opencontainers.image.description":f"maple-proxy {ver} + audio-endpoints.patch",
                       "org.opencontainers.image.source":"https://github.com/MaplePrivacyLabs/Maple"}},
   "rootfs":{"type":"layers","diff_ids":[f"sha256:{diff_id}"]},
   "history":[{"created":now,"created_by":"maple-shim/maple-proxy/build-image.sh"}]}

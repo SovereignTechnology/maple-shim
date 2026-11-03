@@ -1,11 +1,11 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index 2650eae..c10de9e 100644
+index b4b6649..d0419f0 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -36,6 +36,8 @@ pub(crate) fn create_app_with_state(config: Config, state: Arc<ProxyState>) -> R
-         .route("/v1/models", get(proxy_openai_request))
+@@ -37,6 +37,8 @@ pub(crate) fn create_app_with_state(config: Config, state: Arc<ProxyState>) -> R
          .route("/v1/chat/completions", post(proxy_openai_request))
          .route("/v1/embeddings", post(proxy_openai_request))
+         .route("/v1/systemone", post(proxy_openai_request))
 +        .route("/v1/audio/speech", post(proxy_openai_request))
 +        .route("/v1/audio/transcriptions", post(proxy_openai_request))
          .with_state(state)

@@ -1,18 +1,25 @@
-# maple-proxy: audio endpoint patch (upstream 0.4.1, monorepo)
+# maple-proxy: audio endpoint patch (upstream 0.4.5, monorepo)
 
-> **Upstream status (checked 2026-10-02).** The standalone
+> **Upstream status (checked 2026-11-03).** The standalone
 > `OpenSecretCloud/maple-proxy` repo was **retired on 2026-09-08**; development
 > moved to [`MaplePrivacyLabs/Maple`, `proxy/`](https://github.com/MaplePrivacyLabs/Maple/tree/master/proxy).
 > Replacement images publish to `ghcr.io/mapleprivacylabs/maple-proxy`
 > (tags `0.4.0`/`latest`); the legacy `ghcr.io/opensecretcloud/maple-proxy`
 > publisher is disabled.
 >
-> **We are now on 0.4.1**, pinned to monorepo commit
-> `312d6c718e088a3af120677e553df1b69b141b31` (the latest commit touching
-> `proxy/`, 2026-09-22). The audio routes are still absent there, so
-> `audio-endpoints.patch` is still required and still applies clean to
-> `proxy/src/lib.rs` (verified 2026-10-02). The old `0.3.2-audio` image stays
-> imported as the rollback.
+> **We are now on 0.4.5**, pinned to monorepo commit
+> `ea02681568665ea3e07ee9a5ceaf470e1248497a` (the latest commit touching
+> `proxy/`, 2026-10-28; the monorepo has no proxy tags, so the commit is the pin).
+> The audio routes are still absent there (the table is health, `/`, models,
+> chat, embeddings and, since 0.4.2, `/v1/systemone`), so `audio-endpoints.patch`
+> is still required; it was rebased on 2026-11-03 to sit after the systemone
+> route. The `0.4.1-audio` image stays imported as the rollback.
+>
+> **Why 0.4.5 matters:** its SDK bundles the enclave PCR0s approved 2026-10-09
+> and 2026-10-11. 0.4.1 bundled only approvals up to 2026-09-14 and verified the
+> current enclave through the remote PCR history fetched from GitHub. 0.4.5 also
+> carries the crypto-bigint advisory fix (RUSTSEC-2026-0387) and the 360 s stream
+> idle default that lets the backend's 300 s provider-timeout error reach clients.
 
 `maple-proxy` (10.44.0.22:8080) runs upstream Maple proxy plus
 `audio-endpoints.patch` (2 router lines): the stock proxy 404s
@@ -21,8 +28,9 @@ the enclave support both. Home Assistant's maple_tts/maple_stt components and
 ourtranslate's voice path depend on these routes.
 
 **The patch is not optional and it is not a nicety.** Stock upstream has never
-routed audio at *any* version — 0.1.8, 0.1.11, 0.3.2 and the 0.4.1 monorepo all
-have the same route table with no fallback. The handler is path-generic: it
+routed audio at *any* version — 0.1.8, 0.1.11, 0.3.2 and the 0.4.x monorepo all
+have no audio route and no fallback (0.4.5's own tests assert that
+`/v1/audio/speech` is not forwarded). The handler is path-generic: it
 takes `OriginalUri` and forwards it verbatim, and the SDK's
 `is_allowed_inference_endpoint` already whitelists both audio paths. Routing
 them is the whole fix.
@@ -49,18 +57,26 @@ mirroring upstream's Dockerfile in two chroot stages:
 1. builder `docker.io/library/rust:1.89.0-bookworm` — install `pkg-config
    libssl-dev`, apply `audio-endpoints.patch` inside `proxy/`,
    `cargo build --locked --release --bin maple-proxy`;
-2. runtime `docker.io/library/debian:bookworm-slim` — `ca-certificates libssl3
-   curl`, a `maple` user (uid 1001), the binary at `/usr/local/bin/maple-proxy`.
+2. runtime `docker.io/library/debian:bookworm-slim` — `apt-get upgrade` first
+   (the base lags the security pocket: the 0.4.1 image carried old perl-base,
+   libbrotli1 and openssl), then `ca-certificates libssl3 curl`, a `maple` user
+   (uid 1001), the binary at `/usr/local/bin/maple-proxy`.
 
-Only `proxy/{Cargo.toml,Cargo.lock,src}` are used (`maple-sdk` comes from
-crates.io); **`rust-toolchain.toml` is deliberately not copied**, so the
+The source is staged the way upstream's `proxy/Dockerfile` COPYs it:
+`proxy/{Cargo.toml,Cargo.lock,src}` and, **since 0.4.2, the in-tree SDK
+`sdk/rust/{Cargo.toml,src,assets}`** (proxy's `Cargo.toml` patches `maple-sdk`
+to `path = "../sdk/rust"`; the script checks for that line and stages the SDK
+beside `proxy/`). **`rust-toolchain.toml` is deliberately not copied**, so the
 builder image's pinned 1.89.0 is used exactly as upstream's Dockerfile does.
+The version, and so the image name `maple-proxy-<ver>-audio`, is read from
+`proxy/Cargo.toml`. `BUILDER_DIGEST` / `RUNTIME_DIGEST`, when set, are what
+gets pulled (before 2026-11-03 they were only printed).
 The runtime base stays `debian:bookworm-slim` (glibc 2.36) — do not build the
 binary on a newer-glibc host and copy it in.
 
     # on ubuntu-server, as root; SRC is a monorepo checkout at the pinned SHA
-    SRC=/root/build/maple-proxy-0.4.1-audio/src \
-      /path/to/build-image.sh          # imports docker.io/kata/maple-proxy-0.4.1-audio:migrated
+    SRC=/root/build/maple-proxy-0.4.5-audio/src \
+      /path/to/build-image.sh          # imports docker.io/kata/maple-proxy-0.4.5-audio:migrated
 
 ### 0.4.x notes
 
@@ -80,7 +96,7 @@ binary on a newer-glibc host and copy it in.
 ## Deploy
 
 The image ref is generated from `incus/containers.tsv` column 2 in
-sovtech/platform (`maple-proxy-0.4.1-audio`); change it there, not by hand in
+sovtech/platform (`maple-proxy-0.4.5-audio`); change it there, not by hand in
 the unit. A version change is the "new alias" pattern:
 
     sudo git -C /opt/sovtech-infra pull
@@ -90,16 +106,21 @@ the unit. A version change is the "new alias" pattern:
     sudo systemctl restart kata-maple-proxy
 
 **Rollback.** The previous image stays imported as
-`docker.io/kata/maple-proxy-0.3.2-audio:migrated`. Quick rollback (keeps the
-unit on the new alias): `ctr -n default image tag --force
-docker.io/kata/maple-proxy-0.3.2-audio:migrated
-docker.io/kata/maple-proxy-0.4.1-audio:migrated` and restart. Clean rollback:
+`docker.io/kata/maple-proxy-0.4.1-audio:migrated` (the eMudhra CA-layered copy
+the unit ran until 2026-11-03). Quick rollback (keeps the unit on the new
+alias): `ctr -n default image tag --force
+docker.io/kata/maple-proxy-0.4.1-audio:migrated
+docker.io/kata/maple-proxy-0.4.5-audio:migrated` and restart. Clean rollback:
 revert the tsv row, pull, `gen-kata-units.sh --install`, restart. `ctr` renders
 the hyphen in a ref as a space in its own output — never parse that output for
 a ref.
 
 ## Deploys
 
+- **2026-11-03 — 0.4.5-audio.** Monorepo `ea026815`, patch rebased after
+  `/v1/systemone`, in-tree SDK staged, runtime upgraded. CA layer re-applied with
+  `sovtech/ubuntu-server` `ca-layer/build-ca-layer.sh`. Rollback:
+  `maple-proxy-0.4.1-audio:migrated`.
 - **2026-10-02 — 0.4.1-audio.** Built from monorepo `312d6c71` by
   `build-image.sh`, imported `docker.io/kata/maple-proxy-0.4.1-audio:migrated`
   (`sha256:b6831c73…`), containers.tsv row switched (sovtech/platform !33).
