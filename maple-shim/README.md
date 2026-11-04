@@ -10,7 +10,10 @@ the Max and Pro plans.
   `/usr/local/bin/maple-shim.py` on the host now changes nothing.
   **No docker is needed (dockerd stays disabled on ubuntu-server):**
   [`build-image.sh`](build-image.sh) does a full base rebuild — it pulls
-  `python:3.14-slim`, adds `maple-shim.py`, squashes the rootfs to ONE OCI
+  the pinned `python:3.14-slim` by digest (`BASE_TAG`/`BASE_DIGEST`; the fleet
+  Renovate job watches that pin and opens an MR here when upstream rebuilds the
+  tag or Python moves on: merge, rebuild, deploy as below), adds
+  `maple-shim.py`, squashes the rootfs to ONE OCI
   layer, writes the OCI layout by hand and `ctr images import`s it (the
   ci-runner method). Run it as root on ubuntu-server. `keys.env` and `tokens`
   are bind-mounted from the host, so the image holds no secret.

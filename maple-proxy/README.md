@@ -3,9 +3,9 @@
 > **Upstream status (checked 2026-11-03).** The standalone
 > `OpenSecretCloud/maple-proxy` repo was **retired on 2026-09-08**; development
 > moved to [`MaplePrivacyLabs/Maple`, `proxy/`](https://github.com/MaplePrivacyLabs/Maple/tree/master/proxy).
-> Replacement images publish to `ghcr.io/mapleprivacylabs/maple-proxy`
-> (tags `0.4.0`/`latest`); the legacy `ghcr.io/opensecretcloud/maple-proxy`
-> publisher is disabled.
+> Replacement images publish to `ghcr.io/mapleprivacylabs/maple-proxy`, one
+> version tag per proxy release (0.4.0 to 0.4.5, then 0.5.0 on 2026-11-04);
+> the legacy `ghcr.io/opensecretcloud/maple-proxy` publisher is disabled.
 >
 > **We are now on 0.4.5**, pinned to monorepo commit
 > `ea02681568665ea3e07ee9a5ceaf470e1248497a` (the latest commit touching
@@ -48,6 +48,36 @@ and a dead HA voice pipeline.
 Baking it into the image means restarts, reboots, VM migrations and rebuilds
 all keep it. Do not go back to pushing a binary into a running container.
 
+## Upstream tracking (since 2026-11-04)
+
+Every upstream input of this image is pinned in [`build-image.sh`](build-image.sh)
+and watched by the fleet Renovate job (preset `sovtech/fleet-preset`, manager
+M3a), which opens a GitLab MR here when one moves:
+
+| pin | follows | an MR means |
+|---|---|---|
+| `UPSTREAM_TAG` / `UPSTREAM_DIGEST` | `ghcr.io/mapleprivacylabs/maple-proxy`, the image Maple publishes for each proxy release | a new proxy release: rebuild from its source, re-check the audio patch, deploy |
+| `RUNTIME_TAG` / `RUNTIME_DIGEST` | `docker.io/library/debian:bookworm-slim` | a refreshed runtime base (weekly digest batch): rebuild, deploy |
+| `BUILDER_TAG` | upstream's `proxy/Dockerfile` | not watched (`# renovate: ignore`): build-only, and the build refuses to run when upstream's Dockerfile names another rust tag, so it moves with a release |
+
+The release pin is what ties the build to upstream: the build reads the
+`org.opencontainers.image.revision` label of the pinned image (every blob
+checked against its digest) and refuses a `SRC` whose copied paths
+(`proxy/{Cargo.toml,Cargo.lock,src,Dockerfile}`, `sdk/rust/{Cargo.toml,src,assets}`)
+differ from that commit, or whose `proxy/Cargo.toml` version is not
+`UPSTREAM_TAG`. It also refuses when upstream's Dockerfile builds on another
+rust tag or runs on another runtime tag than the script. The image it imports
+carries `org.opencontainers.image.revision` and `.version` labels of its own.
+
+The monorepo has no proxy tags and is busy (most commits are not the proxy),
+so the published image, not the repo, is the release signal.
+
+**The live 0.4.5 image predates the pin.** It was built on 2026-11-03 from
+`ea026815`, the last commit touching `proxy/`. Upstream's own 0.4.5 image was
+built from `6f67e8fb`, whose `sdk/rust/` carries two later model-catalog commits
+(`b4cfef9d`, `7e6674d1`). A rebuild at the pin therefore uses `6f67e8fb`; the
+next release bump makes the question moot.
+
 ## Build
 
 [`build-image.sh`](build-image.sh) does a full no-docker rebuild on
@@ -67,16 +97,20 @@ The source is staged the way upstream's `proxy/Dockerfile` COPYs it:
 `sdk/rust/{Cargo.toml,src,assets}`** (proxy's `Cargo.toml` patches `maple-sdk`
 to `path = "../sdk/rust"`; the script checks for that line and stages the SDK
 beside `proxy/`). **`rust-toolchain.toml` is deliberately not copied**, so the
-builder image's pinned 1.89.0 is used exactly as upstream's Dockerfile does.
+builder image's rust is used exactly as upstream's Dockerfile does.
 The version, and so the image name `maple-proxy-<ver>-audio`, is read from
-`proxy/Cargo.toml`. `BUILDER_DIGEST` / `RUNTIME_DIGEST`, when set, are what
-gets pulled (before 2026-11-03 they were only printed).
+`proxy/Cargo.toml` and must equal `UPSTREAM_TAG`. The runtime is pulled by
+`RUNTIME_DIGEST`; the builder by `BUILDER_DIGEST` when it is set in the
+environment, else by its tag.
 The runtime base stays `debian:bookworm-slim` (glibc 2.36) — do not build the
 binary on a newer-glibc host and copy it in.
 
-    # on ubuntu-server, as root; SRC is a monorepo checkout at the pinned SHA
-    SRC=/root/build/maple-proxy-0.4.5-audio/src \
-      /path/to/build-image.sh          # imports docker.io/kata/maple-proxy-0.4.5-audio:migrated
+    # on ubuntu-server, as root. SRC is a root-owned git checkout of the
+    # monorepo at the revision the pinned image names (the build prints it
+    # and says how to check it out when SRC is elsewhere)
+    git -C /root/build/maple-src fetch origin <revision>
+    git -C /root/build/maple-src checkout --detach <revision>
+    SRC=/root/build/maple-src /path/to/build-image.sh   # imports docker.io/kata/maple-proxy-<ver>-audio:migrated
 
 ### 0.4.x notes
 
@@ -97,7 +131,10 @@ binary on a newer-glibc host and copy it in.
 
 The image ref is generated from `incus/containers.tsv` column 2 in
 sovtech/platform (`maple-proxy-0.4.5-audio`); change it there, not by hand in
-the unit. A version change is the "new alias" pattern:
+the unit. A version change is the "new alias" pattern. **First** re-point the
+`maple-proxy` row of sovtech/fleet-scan `coverage.tsv` to the new
+`kata/images.tsv` row (it is that row's exemption, so platform's L07 stays red
+until it lands; 2026-11-03), then:
 
     sudo git -C /opt/sovtech-infra pull
     sudo /opt/sovtech-infra/kata/gen-kata-units.sh /tmp/u

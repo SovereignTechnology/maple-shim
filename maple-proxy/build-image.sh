@@ -9,30 +9,45 @@
 # Dockerfile: rust:1.89.0-bookworm builds the binary, debian:bookworm-slim is
 # the runtime. Method mirrors sovtech-ubuntu-server/ci-runner/build-image.sh.
 #
-# Source is the Maple monorepo, pinned by SHA in the README. Staged exactly as
-# upstream's proxy/Dockerfile COPYs it: proxy/{Cargo.toml,Cargo.lock,src} and,
-# since 0.4.2, the in-tree SDK sdk/rust/{Cargo.toml,src,assets} (proxy's
-# Cargo.toml patches maple-sdk to path ../sdk/rust). rust-toolchain.toml is
-# deliberately NOT copied, so the builder image's pinned 1.89.0 is used exactly
-# as upstream's Dockerfile does.
+# Source is the Maple monorepo. The release this build follows is pinned below
+# as UPSTREAM_TAG/UPSTREAM_DIGEST: the image Maple publishes for each proxy
+# release (ghcr.io/mapleprivacylabs/maple-proxy). Renovate (the fleet job, preset
+# M3a) watches its tags and opens an MR that bumps both lines. The build reads
+# the source commit from that image's org.opencontainers.image.revision label
+# and refuses a SRC whose proxy/ or sdk/rust/ differs from that commit, so a
+# bumped pin can only be built from the source upstream released.
+#
+# Staged exactly as upstream's proxy/Dockerfile COPYs it:
+# proxy/{Cargo.toml,Cargo.lock,src} and, since 0.4.2, the in-tree SDK
+# sdk/rust/{Cargo.toml,src,assets} (proxy's Cargo.toml patches maple-sdk to path
+# ../sdk/rust). rust-toolchain.toml is deliberately NOT copied, so the builder
+# image's rust is used exactly as upstream's Dockerfile does; the build checks
+# that BUILDER_TAG and RUNTIME_TAG still name the tags of that Dockerfile.
 #
 # usage: build-image.sh [--no-import]      run as root on ubuntu-server
-#   SRC=/path/to/monorepo    dir containing proxy/  (required)
-#   BUILDER_DIGEST=sha256:...  pull rust:1.89.0-bookworm by this digest (default: the tag, now)
-#   RUNTIME_DIGEST=sha256:...  pull debian:bookworm-slim by this digest (default: the tag, now)
+#   SRC=/path/to/monorepo    git checkout of the monorepo at the release revision (required)
+#   BUILDER_DIGEST=sha256:...  pull rust:<BUILDER_TAG> by this digest (default: the tag, now)
 #   OUT_TAG=migrated           tag to import
 set -euo pipefail
 
 BUILDER_NAME=docker.io/library/rust
+# renovate: ignore build-only, and held equal to the rust tag of upstream's proxy/Dockerfile (checked below): it moves with an upstream release, never alone
 BUILDER_TAG=1.89.0-bookworm
 RUNTIME_NAME=docker.io/library/debian
+# renovate: datasource=docker depName=docker.io/library/debian
 RUNTIME_TAG=bookworm-slim
+RUNTIME_DIGEST=sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+UPSTREAM_NAME=ghcr.io/mapleprivacylabs/maple-proxy
+# renovate: datasource=docker depName=ghcr.io/mapleprivacylabs/maple-proxy
+UPSTREAM_TAG=0.4.5
+UPSTREAM_DIGEST=sha256:68ca01b7550594022203723e32468604e00339bc1882dfd77b93b3ff807f5dfb
+# renovate: ignore the tag the build imports as, not an input
 OUT_TAG=${OUT_TAG:-migrated}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SRC=${SRC:-}
 
 [ "$(id -u)" = 0 ] || { echo "!! run as root" >&2; exit 1; }
-for t in ctr jq tar gzip sha256sum python3 git; do
+for t in ctr jq tar gzip sha256sum python3 git curl; do
     command -v "$t" >/dev/null || { echo "!! need $t" >&2; exit 1; }
 done
 [ -n "$SRC" ] && [ -d "$SRC/proxy/src" ] || { echo "!! SRC must point at a monorepo checkout containing proxy/ (got '$SRC')" >&2; exit 1; }
@@ -41,6 +56,7 @@ done
 VER=$(awk '/^\[/{p=($0=="[package]")} p && /^version *= *"/{gsub(/.*= *"|".*/,""); print; exit}' "$SRC/proxy/Cargo.toml")
 case "$VER" in [0-9]*.[0-9]*.[0-9]*) ;; *) echo "!! no [package] version in $SRC/proxy/Cargo.toml (got '$VER')" >&2; exit 1 ;; esac
 case "$VER" in *[!0-9.]*) echo "!! version '$VER' is not plain digits and dots" >&2; exit 1 ;; esac
+[ "$VER" = "$UPSTREAM_TAG" ] || { echo "!! SRC is proxy $VER but the pinned upstream release is $UPSTREAM_TAG" >&2; exit 1; }
 OUT_NAME=docker.io/kata/maple-proxy-$VER-audio
 W=${W:-/root/build/maple-proxy-$VER-audio/image}
 # 0.4.2+ build against the in-tree SDK; stage it when the manifest says so.
@@ -95,8 +111,56 @@ export_base() { # name tag outdir [digest] -- by digest when one is given, else 
     tar -C "$3" -xf base.tar
 }
 
+ghcr_get() { # manifests|blobs digest outfile accept -- anonymous read of $UPSTREAM_NAME, checked against the digest asked for
+    [[ $2 =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "!! '$2' is not sha256:<64 hex>" >&2; return 1; }
+    curl -fsSL --proto =https --proto-redir =https --max-time 120 \
+        -H "Authorization: Bearer $GHCR_TOKEN" -H "Accept: $4" \
+        -o "$3" "https://ghcr.io/v2/${UPSTREAM_NAME#ghcr.io/}/$1/$2"
+    [ "sha256:$(sha256sum < "$3" | cut -d' ' -f1)" = "$2" ] || { echo "!! $2: the body does not match its digest" >&2; return 1; }
+}
+
+up_from() { # stage -> the image of upstream's 'FROM <image> AS <stage>', registry and namespace dropped
+    awk -v s="$1" 'toupper($1)=="FROM" && toupper($(NF-1))=="AS" && tolower($NF)==s {print $2; exit}' "$SRC/proxy/Dockerfile" | sed 's#.*/##'
+}
+
 # --------------------------------------------------------------------------- #
-echo "== 0. builder base $BUILDER_NAME:$BUILDER_TAG"
+# The source must be exactly what upstream released as $UPSTREAM_TAG: the commit
+# the pinned image's revision label names, for every path this build copies.
+echo "== 0a. upstream release $UPSTREAM_NAME:$UPSTREAM_TAG"
+case "$UPSTREAM_NAME" in ghcr.io/?*) ;; *) echo "!! UPSTREAM_NAME must be on ghcr.io (got '$UPSTREAM_NAME')" >&2; exit 1 ;; esac
+mkdir -p "$W/upstream"
+GHCR_TOKEN=$(curl -fsS --proto =https --max-time 30 "https://ghcr.io/token?scope=repository:${UPSTREAM_NAME#ghcr.io/}:pull" | jq -r '.token // empty')
+[[ $GHCR_TOKEN =~ ^[A-Za-z0-9._~+/=-]+$ ]] || { echo "!! no usable anonymous pull token from ghcr.io" >&2; exit 1; }
+MAN='application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+ghcr_get manifests "$UPSTREAM_DIGEST" "$W/upstream/top" "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, $MAN"
+if jq -e '.manifests | type == "array"' "$W/upstream/top" >/dev/null; then
+    ghcr_get manifests "$(jq -r '[.manifests[] | select(.platform.architecture=="amd64" and .platform.os=="linux")][0].digest // ""' "$W/upstream/top")" \
+        "$W/upstream/manifest" "$MAN"
+else
+    cp "$W/upstream/top" "$W/upstream/manifest"
+fi
+ghcr_get blobs "$(jq -r '.config.digest // ""' "$W/upstream/manifest")" "$W/upstream/config" 'application/vnd.oci.image.config.v1+json, application/octet-stream'
+REV=$(jq -r '.config.Labels["org.opencontainers.image.revision"] // ""' "$W/upstream/config")
+up_ver=$(jq -r '.config.Labels["org.opencontainers.image.version"] // ""' "$W/upstream/config")
+[[ $REV =~ ^[0-9a-f]{40}$ ]] || { echo "!! the pinned image names no source revision (got '$REV')" >&2; exit 1; }
+[ "$up_ver" = "$UPSTREAM_TAG" ] || { echo "!! the pinned image is version '$up_ver', not $UPSTREAM_TAG" >&2; exit 1; }
+echo "   source revision $REV"
+# Git refuses a SRC that root does not own (safe.directory): never override that here, a foreign
+# repo config (core.fsmonitor) would run as root.
+COPIED=(proxy/Cargo.toml proxy/Cargo.lock proxy/src proxy/Dockerfile sdk/rust/Cargo.toml sdk/rust/src sdk/rust/assets)
+git -C "$SRC" rev-parse -q --verify "$REV^{commit}" >/dev/null \
+    || { echo "!! SRC has no commit $REV: git -C $SRC fetch origin $REV && git -C $SRC checkout --detach $REV" >&2; exit 1; }
+git -C "$SRC" diff --quiet "$REV" -- "${COPIED[@]}" \
+    || { echo "!! SRC differs from $REV under proxy/ or sdk/rust/: git -C $SRC checkout --detach $REV" >&2; exit 1; }
+[ -z "$(git -C "$SRC" status --porcelain --untracked-files=all --ignored -- "${COPIED[@]}")" ] \
+    || { echo "!! SRC has untracked or ignored files under the paths this build copies" >&2; exit 1; }
+[ "$(up_from builder)" = "${BUILDER_NAME##*/}:$BUILDER_TAG" ] \
+    || { echo "!! upstream builds with '$(up_from builder)', this script with ${BUILDER_NAME##*/}:$BUILDER_TAG: update BUILDER_TAG" >&2; exit 1; }
+[ "$(up_from runtime)" = "${RUNTIME_NAME##*/}:$RUNTIME_TAG" ] \
+    || { echo "!! upstream runs on '$(up_from runtime)', this script on ${RUNTIME_NAME##*/}:$RUNTIME_TAG: update the RUNTIME pin" >&2; exit 1; }
+
+# --------------------------------------------------------------------------- #
+echo "== 0b. builder base $BUILDER_NAME:$BUILDER_TAG"
 cd "$W"
 export_base "$BUILDER_NAME" "$BUILDER_TAG" "$W/base" "${BUILDER_DIGEST:-}"
 manifest=$(resolve "$(jq -r '.manifests[0].digest' base/index.json)")
@@ -144,14 +208,13 @@ echo "   built $(du -h "$BIN" | cut -f1) binary"
 
 # --------------------------------------------------------------------------- #
 echo "== 3. runtime base $RUNTIME_NAME:$RUNTIME_TAG"
-export_base "$RUNTIME_NAME" "$RUNTIME_TAG" "$W/base" "${RUNTIME_DIGEST:-}"
+export_base "$RUNTIME_NAME" "$RUNTIME_TAG" "$W/base" "$RUNTIME_DIGEST"
 manifest=$(resolve "$(jq -r '.manifests[0].digest' base/index.json)")
 mkdir -p "$W/rootfs"
 for l in $(jq -r '.layers[].digest' "$manifest"); do
     tar -C "$W/rootfs" --numeric-owner -xpf "base/blobs/sha256/${l#sha256:}"
 done
-RUNTIME_DIGEST=${RUNTIME_DIGEST:-$(digest_of "$RUNTIME_NAME" "$RUNTIME_TAG")}
-echo "   $RUNTIME_NAME@${RUNTIME_DIGEST:-<unresolved>}"
+echo "   $RUNTIME_NAME@$RUNTIME_DIGEST"
 
 cp /etc/resolv.conf "$W/rootfs/etc/resolv.conf"
 mkdir -p "$W/rootfs/proc" "$W/rootfs/dev" "$W/rootfs/sys"
@@ -186,9 +249,9 @@ layer_size=$(stat -c %s "$W/layer.tar.gz")
 mv "$W/layer.tar.gz" "$W/oci/blobs/sha256/$layer_digest"
 
 echo "== 5. OCI layout"
-python3 - "$W" "$diff_id" "$layer_digest" "$layer_size" "$OUT_NAME" "$OUT_TAG" "$RUNTIME_DIGEST" "$VER" <<'PY'
+python3 - "$W" "$diff_id" "$layer_digest" "$layer_size" "$OUT_NAME" "$OUT_TAG" "$RUNTIME_DIGEST" "$VER" "$REV" <<'PY'
 import json, hashlib, sys
-W, diff_id, ldig, lsize, name, tag, base, ver = sys.argv[1:]
+W, diff_id, ldig, lsize, name, tag, base, ver, rev = sys.argv[1:]
 import datetime
 now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
 def blob(obj):
@@ -210,7 +273,9 @@ config = {
             "ExposedPorts":{"8080/tcp":{}},
             "Labels":{"org.opencontainers.image.base.digest":base,
                       "org.opencontainers.image.description":f"maple-proxy {ver} + audio-endpoints.patch",
-                      "org.opencontainers.image.source":"https://github.com/MaplePrivacyLabs/Maple"}},
+                      "org.opencontainers.image.source":"https://github.com/MaplePrivacyLabs/Maple",
+                      "org.opencontainers.image.revision":rev,
+                      "org.opencontainers.image.version":ver}},
   "rootfs":{"type":"layers","diff_ids":[f"sha256:{diff_id}"]},
   "history":[{"created":now,"created_by":"maple-shim/maple-proxy/build-image.sh"}]}
 cd_, cs = blob(config)

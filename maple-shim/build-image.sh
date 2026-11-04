@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build docker.io/kata/host-maple-shim:migrated from a python:3.14-slim base plus
+# Build docker.io/kata/host-maple-shim:migrated from the pinned python slim base plus
 # maple-shim.py. Full base rebuild, no dockerd: export the base rootfs from
 # containerd, add the script, squash to ONE OCI layer, write the OCI layout by
 # hand, `ctr images import`. Method mirrors sovtech-ubuntu-server/ci-runner.
@@ -8,16 +8,22 @@
 # (see the Dockerfile). keys.env and tokens are NOT in the image: they are
 # bind-mounted at run time, so the image holds no secret.
 #
+# The base is pinned below by tag AND digest and pulled by the digest. Renovate
+# (the fleet job, preset M3a) watches the tag and opens an MR that moves both
+# lines: a same-tag digest refresh when upstream rebuilds python:3.14-slim (its
+# Debian security fixes), a new tag on a Python release. Merge, rebuild, deploy.
+#
 # usage: build-image.sh [--no-import]        run as root on ubuntu-server
-#   BASE_DIGEST=sha256:...   pin the base (default: resolve python:3.14-slim now)
 #   OUT_TAG=migrated         tag to import (default migrated)
 #   W=/root/build/maple-shim-image   build dir (must be under /root/build/)
 set -euo pipefail
 
 BASE_NAME=docker.io/library/python
+# renovate: datasource=docker depName=docker.io/library/python
 BASE_TAG=3.14-slim
-BASE_DIGEST=${BASE_DIGEST:-}
+BASE_DIGEST=sha256:0741d101873c12ab927e6f8653feb8862b9bd58771177acb1b885b95141f91b4
 OUT_NAME=docker.io/kata/host-maple-shim
+# renovate: ignore the tag the build imports as, not an input
 OUT_TAG=${OUT_TAG:-migrated}
 W=${W:-/root/build/maple-shim-image}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -35,15 +41,12 @@ rm -rf "$W"; mkdir -p "$W/rootfs" "$W/oci/blobs/sha256" "$W/base"
 cd "$W"
 
 echo "== 0. base image $BASE_NAME:$BASE_TAG"
-if [ -z "$BASE_DIGEST" ]; then
-    ctr -n default image pull --platform linux/amd64 "$BASE_NAME:$BASE_TAG" >/dev/null
-    BASE_DIGEST=$(ctr -n default image ls | awk -v n="$BASE_NAME:$BASE_TAG" '$1==n {print $3}')
-fi
-[ -n "$BASE_DIGEST" ] || { echo "!! could not resolve $BASE_NAME:$BASE_TAG digest" >&2; exit 1; }
+[[ $BASE_DIGEST =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "!! BASE_DIGEST '$BASE_DIGEST' is not sha256:<64 hex>" >&2; exit 1; }
+ctr -n default image pull --platform linux/amd64 "$BASE_NAME@$BASE_DIGEST" >/dev/null
 echo "   $BASE_NAME@$BASE_DIGEST"
 
 echo "== 1. export base rootfs"
-ctr -n default image export --platform linux/amd64 base.tar "$BASE_NAME:$BASE_TAG"
+ctr -n default image export --platform linux/amd64 base.tar "$BASE_NAME@$BASE_DIGEST"
 tar -C base -xf base.tar
 resolve() { # index -> (nested index) -> amd64 manifest blob path
     local d=$1 mt
@@ -74,9 +77,9 @@ layer_size=$(stat -c %s layer.tar.gz)
 mv layer.tar.gz "oci/blobs/sha256/$layer_digest"
 
 echo "== 4. OCI layout (config inherits the base's Env, then sets the shim's)"
-python3 - "$diff_id" "$layer_digest" "$layer_size" "$OUT_NAME" "$OUT_TAG" "$BASE_DIGEST" "$base_config" <<'PY'
+python3 - "$diff_id" "$layer_digest" "$layer_size" "$OUT_NAME" "$OUT_TAG" "$BASE_DIGEST" "$base_config" "python:$BASE_TAG" <<'PY'
 import json, hashlib, sys, datetime
-diff_id, ldig, lsize, name, tag, base, base_config_path = sys.argv[1:]
+diff_id, ldig, lsize, name, tag, base, base_config_path, base_ref = sys.argv[1:]
 now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
 base_cfg = json.load(open(base_config_path))
 env = list(base_cfg.get("config", {}).get("Env", []))
@@ -89,7 +92,7 @@ def blob(obj):
     d = hashlib.sha256(b).hexdigest()
     open(f"oci/blobs/sha256/{d}","wb").write(b)
     return d, len(b)
-desc = "maple-shim (stdlib) on python:3.14-slim; keys bind-mounted, not in image"
+desc = f"maple-shim (stdlib) on {base_ref}; keys bind-mounted, not in image"
 config = {
   "architecture":"amd64","os":"linux","created":now,
   "config":{"Env":env,

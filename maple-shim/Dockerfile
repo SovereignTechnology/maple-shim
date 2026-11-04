@@ -13,6 +13,9 @@
 # The keys are NOT baked in and are NOT passed as environment variables: keys.env and
 # tokens are bind-mounted from the host at run time, so this image holds no secret and
 # maple-shim keeps its "one file, one holder" property.
+# Reference only: the deployed image is built by build-image.sh (no dockerd on
+# ubuntu-server), which pins this base by tag AND digest. Renovate watches that
+# pin, not this line; keep the tag here equal to its BASE_TAG.
 FROM python:3.14-slim
 
 COPY maple-shim.py /usr/local/bin/maple-shim.py
