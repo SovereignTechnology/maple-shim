@@ -39,8 +39,8 @@ RUNTIME_TAG=bookworm-slim
 RUNTIME_DIGEST=sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 UPSTREAM_NAME=ghcr.io/mapleprivacylabs/maple-proxy
 # renovate: datasource=docker depName=ghcr.io/mapleprivacylabs/maple-proxy
-UPSTREAM_TAG=0.4.5
-UPSTREAM_DIGEST=sha256:68ca01b7550594022203723e32468604e00339bc1882dfd77b93b3ff807f5dfb
+UPSTREAM_TAG=0.5.0
+UPSTREAM_DIGEST=sha256:d6165a34aa2ea50d206e57223a3016da4051ddf9f8bd87f8636c2d1b5ed9940a
 # renovate: ignore the tag the build imports as, not an input
 OUT_TAG=${OUT_TAG:-migrated}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

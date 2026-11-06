@@ -1,4 +1,4 @@
-# maple-proxy: audio endpoint patch (upstream 0.4.5, monorepo)
+# maple-proxy: audio endpoint patch (upstream 0.5.0, monorepo)
 
 > **Upstream status (checked 2026-11-03).** The standalone
 > `OpenSecretCloud/maple-proxy` repo was **retired on 2026-09-08**; development
@@ -7,13 +7,21 @@
 > version tag per proxy release (0.4.0 to 0.4.5, then 0.5.0 on 2026-11-04);
 > the legacy `ghcr.io/opensecretcloud/maple-proxy` publisher is disabled.
 >
-> **We are now on 0.4.5**, pinned to monorepo commit
-> `ea02681568665ea3e07ee9a5ceaf470e1248497a` (the latest commit touching
-> `proxy/`, 2026-10-28; the monorepo has no proxy tags, so the commit is the pin).
-> The audio routes are still absent there (the table is health, `/`, models,
-> chat, embeddings and, since 0.4.2, `/v1/systemone`), so `audio-endpoints.patch`
-> is still required; it was rebased on 2026-11-03 to sit after the systemone
-> route. The `0.4.1-audio` image stays imported as the rollback.
+> **We are now on 0.5.0** (2026-11-06), monorepo commit
+> `c760e5b833c7724717deb54478b847bfc7fd0172`: the revision the upstream image
+> `ghcr.io/mapleprivacylabs/maple-proxy:0.5.0` names, which `build-image.sh`
+> reads from its label and enforces. The audio routes are still absent upstream
+> (the table is health, `/`, models, chat, embeddings and `/v1/systemone`), so
+> `audio-endpoints.patch` is still required; it applies to 0.5.0 unchanged.
+> The `0.4.5-audio` image stays imported as the rollback.
+>
+> **What 0.5.0 changes for us** (`proxy/` and `sdk/rust/`, `ea026815..c760e5b8`,
+> 4 commits): the standalone binary tags its encrypted requests with client app
+> `proxy` (upstream: no effect on authentication, model routing or pricing);
+> SDK 4.2.0 adds optional catalog fields. No new environment knobs. Separately,
+> and whatever proxy version runs, Maple's server refuses `/v1/chat/completions`
+> to Free-plan callers since #1437 (2026-11-03), and GPT-OSS 120B and Llama 3.3
+> are Pro-only.
 >
 > **Why 0.4.5 matters:** its SDK bundles the enclave PCR0s approved 2026-10-09
 > and 2026-10-11. 0.4.1 bundled only approvals up to 2026-09-14 and verified the
@@ -72,11 +80,9 @@ carries `org.opencontainers.image.revision` and `.version` labels of its own.
 The monorepo has no proxy tags and is busy (most commits are not the proxy),
 so the published image, not the repo, is the release signal.
 
-**The live 0.4.5 image predates the pin.** It was built on 2026-11-03 from
-`ea026815`, the last commit touching `proxy/`. Upstream's own 0.4.5 image was
-built from `6f67e8fb`, whose `sdk/rust/` carries two later model-catalog commits
-(`b4cfef9d`, `7e6674d1`). A rebuild at the pin therefore uses `6f67e8fb`; the
-next release bump makes the question moot.
+**0.4.5 predated the pin.** It was built on 2026-11-03 from `ea026815`, the
+last commit touching `proxy/`; upstream's own 0.4.5 image was built from
+`6f67e8fb`. Since 0.5.0 every build is from the revision the pinned image names.
 
 ## Build
 
@@ -130,7 +136,7 @@ binary on a newer-glibc host and copy it in.
 ## Deploy
 
 The image ref is generated from `incus/containers.tsv` column 2 in
-sovtech/platform (`maple-proxy-0.4.5-audio`); change it there, not by hand in
+sovtech/platform (`maple-proxy-0.5.0-audio`); change it there, not by hand in
 the unit. A version change is the "new alias" pattern. **First** re-point the
 `maple-proxy` row of sovtech/fleet-scan `coverage.tsv` to the new
 `kata/images.tsv` row (it is that row's exemption, so platform's L07 stays red
@@ -143,20 +149,25 @@ until it lands; 2026-11-03), then:
     sudo systemctl restart kata-maple-proxy
 
 **Rollback.** The previous image stays imported as
-`docker.io/kata/maple-proxy-0.4.1-audio:migrated` (the eMudhra CA-layered copy
-the unit ran until 2026-11-03). Quick rollback (keeps the unit on the new
-alias): `ctr -n default image tag --force
-docker.io/kata/maple-proxy-0.4.1-audio:migrated
-docker.io/kata/maple-proxy-0.4.5-audio:migrated` and restart. Clean rollback:
+`docker.io/kata/maple-proxy-0.4.5-audio:migrated` (`sha256:e93e5211…`, the image
+the unit ran from 2026-11-03 to 2026-11-06). Quick rollback (keeps the unit on the
+new alias): `ctr -n default image tag --force
+docker.io/kata/maple-proxy-0.4.5-audio:migrated
+docker.io/kata/maple-proxy-0.5.0-audio:migrated` and restart. Clean rollback:
 revert the tsv row, pull, `gen-kata-units.sh --install`, restart. `ctr` renders
 the hyphen in a ref as a space in its own output — never parse that output for
 a ref.
 
 ## Deploys
 
+- **2026-11-06 — 0.5.0-audio.** Monorepo `c760e5b8` (the revision of upstream's
+  0.5.0 image), patch unchanged, same builder and runtime pins as 0.4.5.
+  `docker.io/kata/maple-proxy-0.5.0-audio:migrated` = `sha256:673f9535…`.
+  `build-ca-layer.sh` found neither eMudhra root (bundle 148): no layer.
+  Rollback: `maple-proxy-0.4.5-audio:migrated`.
 - **2026-11-03 — 0.4.5-audio.** Monorepo `ea026815`, patch rebased after
-  `/v1/systemone`, in-tree SDK staged, runtime upgraded. CA layer re-applied with
-  `sovtech/ubuntu-server` `ca-layer/build-ca-layer.sh`. Rollback:
+  `/v1/systemone`, in-tree SDK staged, runtime upgraded. `build-ca-layer.sh`
+  found neither eMudhra root, so no CA layer was added. Rollback:
   `maple-proxy-0.4.1-audio:migrated`.
 - **2026-10-02 — 0.4.1-audio.** Built from monorepo `312d6c71` by
   `build-image.sh`, imported `docker.io/kata/maple-proxy-0.4.1-audio:migrated`
