@@ -10,7 +10,7 @@ the Max and Pro plans.
   `/usr/local/bin/maple-shim.py` on the host now changes nothing.
   **No docker is needed (dockerd stays disabled on ubuntu-server):**
   [`build-image.sh`](build-image.sh) does a full base rebuild — it pulls
-  the pinned `python:3.14-slim` by digest (`BASE_TAG`/`BASE_DIGEST`; the fleet
+  the pinned `python:3.15-slim` by digest (`BASE_TAG`/`BASE_DIGEST`; the fleet
   Renovate job watches that pin and opens an MR here when upstream rebuilds the
   tag or Python moves on: merge, rebuild, deploy as below), adds
   `maple-shim.py`, squashes the rootfs to ONE OCI
@@ -152,6 +152,16 @@ process or network at all.
 
 ## Deploys
 
+- **2026-11-06 — Python 3.15.** Full base rebuild from `python:3.15-slim`
+  (index `sha256:e97b88e4…`, Python 3.15.2, Debian 13) by `build-image.sh`
+  (Renovate !3), imported as `docker.io/kata/host-maple-shim:py315` and retagged
+  `:migrated` (`sha256:429537d9…`); `build-ca-layer.sh` found neither eMudhra root.
+  Before the switch both suites passed on CPython 3.15.2 in a Kata VM (`test_order.py`
+  6/6, also with `-W error::DeprecationWarning`; `tests-failover.sh` 19/19).
+  Verified `/health` status ok, strict, `active_tier: max`; unauthenticated chat and
+  speech 401, unknown path 404. Rollback: `ctr -n default image tag --force
+  docker.io/kata/host-maple-shim:pre-py315 docker.io/kata/host-maple-shim:migrated`,
+  then restart (`:pre-py315` = `sha256:fc43a1a2…`, the raw-audio build on 3.14.8).
 - **2026-10-02 — Transport V2 raw-audio handling.** Full base rebuild by
   `build-image.sh`, imported as `docker.io/kata/host-maple-shim:rawaudio` and
   retagged `:migrated` (`sha256:fc43a1a2…`). Rollback:

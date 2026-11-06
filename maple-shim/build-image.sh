@@ -10,7 +10,7 @@
 #
 # The base is pinned below by tag AND digest and pulled by the digest. Renovate
 # (the fleet job, preset M3a) watches the tag and opens an MR that moves both
-# lines: a same-tag digest refresh when upstream rebuilds python:3.14-slim (its
+# lines: a same-tag digest refresh when upstream rebuilds python:3.15-slim (its
 # Debian security fixes), a new tag on a Python release. Merge, rebuild, deploy.
 #
 # usage: build-image.sh [--no-import]        run as root on ubuntu-server
@@ -20,8 +20,8 @@ set -euo pipefail
 
 BASE_NAME=docker.io/library/python
 # renovate: datasource=docker depName=docker.io/library/python
-BASE_TAG=3.14-slim
-BASE_DIGEST=sha256:0741d101873c12ab927e6f8653feb8862b9bd58771177acb1b885b95141f91b4
+BASE_TAG=3.15-slim
+BASE_DIGEST=sha256:e97b88e416c3c01eb427b21fd8cd3ebf006e6ee38afcfcc3cae1c54ee2ab0a75
 OUT_NAME=docker.io/kata/host-maple-shim
 # renovate: ignore the tag the build imports as, not an input
 OUT_TAG=${OUT_TAG:-migrated}

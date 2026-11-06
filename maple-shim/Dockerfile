@@ -16,7 +16,7 @@
 # Reference only: the deployed image is built by build-image.sh (no dockerd on
 # ubuntu-server), which pins this base by tag AND digest. Renovate watches that
 # pin, not this line; keep the tag here equal to its BASE_TAG.
-FROM python:3.14-slim
+FROM python:3.15-slim
 
 COPY maple-shim.py /usr/local/bin/maple-shim.py
 RUN chmod 0755 /usr/local/bin/maple-shim.py
