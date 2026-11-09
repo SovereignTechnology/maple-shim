@@ -36,7 +36,7 @@ BUILDER_TAG=1.89.0-bookworm
 RUNTIME_NAME=docker.io/library/debian
 # renovate: datasource=docker depName=docker.io/library/debian
 RUNTIME_TAG=bookworm-slim
-RUNTIME_DIGEST=sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+RUNTIME_DIGEST=sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 UPSTREAM_NAME=ghcr.io/mapleprivacylabs/maple-proxy
 # renovate: datasource=docker depName=ghcr.io/mapleprivacylabs/maple-proxy
 UPSTREAM_TAG=0.5.0
