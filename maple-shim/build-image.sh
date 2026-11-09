@@ -21,7 +21,7 @@ set -euo pipefail
 BASE_NAME=docker.io/library/python
 # renovate: datasource=docker depName=docker.io/library/python
 BASE_TAG=3.15-slim
-BASE_DIGEST=sha256:e97b88e416c3c01eb427b21fd8cd3ebf006e6ee38afcfcc3cae1c54ee2ab0a75
+BASE_DIGEST=sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
 OUT_NAME=docker.io/kata/host-maple-shim
 # renovate: ignore the tag the build imports as, not an input
 OUT_TAG=${OUT_TAG:-migrated}
