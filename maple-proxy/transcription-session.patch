@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 38a0de8..9b58f5d 100644
+index 38a0de89..9b58f5dd 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -1542,6 +1542,7 @@ dependencies = [
@@ -11,7 +11,7 @@ index 38a0de8..9b58f5d 100644
  
  [[package]]
 diff --git a/Cargo.toml b/Cargo.toml
-index eeebd16..56bf237 100644
+index eeebd166..56bf237d 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -57,6 +57,9 @@ anyhow = "1.0.103"
@@ -25,7 +25,7 @@ index eeebd16..56bf237 100644
  axum-test = "18.0.1"
  tokio = { version = "1.47", features = ["test-util"] }
 diff --git a/src/config.rs b/src/config.rs
-index 63e1314..982a094 100644
+index 63e13140..982a094f 100644
 --- a/src/config.rs
 +++ b/src/config.rs
 @@ -229,6 +229,10 @@ impl OpenAIError {
@@ -40,7 +40,7 @@ index 63e1314..982a094 100644
  
  #[cfg(test)]
 diff --git a/src/lib.rs b/src/lib.rs
-index 244ebfb..50cd6a3 100644
+index 244ebfba..50cd6a30 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -3,7 +3,7 @@ mod proxy;
@@ -62,7 +62,7 @@ index 244ebfb..50cd6a3 100644
          .layer(
              ServiceBuilder::new()
 diff --git a/src/proxy.rs b/src/proxy.rs
-index b714efd..0fe0c06 100644
+index b714efdc..727d85a4 100644
 --- a/src/proxy.rs
 +++ b/src/proxy.rs
 @@ -8,11 +8,21 @@ use axum::{
@@ -126,7 +126,7 @@ index b714efd..0fe0c06 100644
              | "cookie"
              | "set-cookie"
              | "accept-encoding"
-@@ -391,6 +408,313 @@ fn stream_with_timeouts(
+@@ -391,6 +408,402 @@ fn stream_with_timeouts(
      })
  }
  
@@ -186,6 +186,24 @@ index b714efd..0fe0c06 100644
 +        let mut slots = self.slots.lock().await;
 +        Arc::clone(slots.entry(ident.clone()).or_default())
 +    }
++
++    /// Drop an account's slot after a failed login, so identifiers that never
++    /// logged in do not pile up: anyone who can reach the proxy can name one.
++    /// The slot stays while it holds a session or another request holds it.
++    /// The caller must have released its own lock on `slot`.
++    async fn forget_if_unused(&self, ident: &LoginIdent, slot: &Arc<Mutex<Option<SessionEntry>>>) {
++        let mut slots = self.slots.lock().await;
++        // Every clone is handed out under `slots`, so with it held the count can
++        // only fall: 2 = the map's own reference plus the caller's.
++        let unused = slots.get(ident).is_some_and(|current| {
++            Arc::ptr_eq(current, slot)
++                && Arc::strong_count(slot) == 2
++                && slot.try_lock().is_ok_and(|inner| inner.is_none())
++        });
++        if unused {
++            slots.remove(ident);
++        }
++    }
 +}
 +
 +fn login_client_id() -> Uuid {
@@ -239,7 +257,8 @@ index b714efd..0fe0c06 100644
 +impl ProxyState {
 +    /// The logged-in client for this account, logging in (once) if needed.
 +    /// Logins for one account are serialised; different accounts do not block
-+    /// each other. A changed password replaces the cached session.
++    /// each other. A changed password replaces the cached session, but only
++    /// once it has logged in: a wrong password must not evict a working session.
 +    async fn login_client(
 +        &self,
 +        login: &LoginCredentials,
@@ -251,8 +270,28 @@ index b714efd..0fe0c06 100644
 +                return Ok(Arc::clone(&entry.client));
 +            }
 +        }
-+        *guard = None;
 +
++        match self.fresh_login(login).await {
++            Ok(client) => {
++                *guard = Some(SessionEntry {
++                    client: Arc::clone(&client),
++                    password: login.password.clone(),
++                });
++                Ok(client)
++            }
++            Err(error) => {
++                drop(guard);
++                self.sessions.forget_if_unused(&login.ident, &slot).await;
++                Err(error)
++            }
++        }
++    }
++
++    /// A new attested client logged in as this account. Touches no cached state.
++    async fn fresh_login(
++        &self,
++        login: &LoginCredentials,
++    ) -> Result<Arc<OpenSecretClient>, ProxyError> {
 +        let request_timeout = self.config.request_timeout();
 +        let client = create_shared_client(
 +            &self.config.backend_url,
@@ -285,12 +324,7 @@ index b714efd..0fe0c06 100644
 +            Ok(Ok(_)) => {}
 +        }
 +
-+        let client = Arc::new(client);
-+        *guard = Some(SessionEntry {
-+            client: Arc::clone(&client),
-+            password: login.password.clone(),
-+        });
-+        Ok(client)
++        Ok(Arc::new(client))
 +    }
 +
 +    /// Forget a session the backend stopped accepting -- but only if it is still
@@ -426,6 +460,61 @@ index b714efd..0fe0c06 100644
 +        assert!(forwarded.get(LOGIN_ID_HEADER).is_none());
 +        assert!(forwarded.get(LOGIN_PASSWORD_HEADER).is_none());
 +        assert!(forwarded.get("content-type").is_some());
++    }
++
++    /// Loopback port 1 refuses at once, so every attestation (and so every login) fails fast.
++    fn unreachable_state() -> ProxyState {
++        let config = Config::new("127.0.0.1".into(), 0, "http://127.0.0.1:1".into())
++            .with_request_timeout_secs(5);
++        ProxyState::new(config)
++    }
++
++    fn login(email: &str, password: &str) -> LoginCredentials {
++        LoginCredentials {
++            ident: LoginIdent::Email(email.into()),
++            password: password.into(),
++        }
++    }
++
++    #[tokio::test]
++    async fn a_failed_login_leaves_no_slot_behind() {
++        let state = unreachable_state();
++        for n in 0..3 {
++            assert!(state.login_client(&login(&format!("{n}@b.test"), "pw")).await.is_err());
++        }
++        assert!(state.sessions.slots.lock().await.is_empty());
++    }
++
++    #[tokio::test]
++    async fn a_wrong_password_does_not_evict_a_working_session() {
++        let state = unreachable_state();
++        let cached = Arc::new(OpenSecretClient::new("http://127.0.0.1:1").unwrap());
++        let ident = LoginIdent::Email("a@b.test".into());
++        *state.sessions.slot(&ident).await.lock().await = Some(SessionEntry {
++            client: Arc::clone(&cached),
++            password: "right".into(),
++        });
++
++        assert!(state.login_client(&login("a@b.test", "wrong")).await.is_err());
++
++        let Ok(got) = state.login_client(&login("a@b.test", "right")).await else {
++            panic!("a wrong password evicted the working session");
++        };
++        assert!(Arc::ptr_eq(&got, &cached));
++        assert_eq!(state.sessions.slots.lock().await.len(), 1);
++    }
++
++    #[tokio::test]
++    async fn a_slot_another_request_holds_is_kept() {
++        let sessions = LoginSessions::default();
++        let ident = LoginIdent::Email("a@b.test".into());
++        let mine = sessions.slot(&ident).await;
++        let theirs = sessions.slot(&ident).await;
++        sessions.forget_if_unused(&ident, &mine).await;
++        assert_eq!(sessions.slots.lock().await.len(), 1, "another request still holds it");
++        drop(theirs);
++        sessions.forget_if_unused(&ident, &mine).await;
++        assert!(sessions.slots.lock().await.is_empty());
 +    }
 +
 +    #[test]

@@ -176,6 +176,20 @@ def _redact(text: str) -> str:
     return text
 
 
+def _redact_body(body: bytes) -> bytes:
+    """_redact for an upstream error body that is relayed to the client.
+
+    Clients hold tokens precisely so that they never see a key or a login, so
+    an echo must not reach them either. Byte-level, so a body that is not
+    UTF-8 passes through unchanged apart from the secrets."""
+    secrets = list((globals().get("KEYS") or {}).values())
+    secrets += [login.get("password") for login in (globals().get("LOGINS") or {}).values()]
+    for value in secrets:
+        if value and value.encode() in body:
+            body = body.replace(value.encode(), b"<redacted>")
+    return body
+
+
 def _load_keys() -> dict:
     """Maple keys from the systemd credential, or a root-owned file when run
     by hand. Failing to find one is fatal: a shim with no key is a shim that
@@ -525,7 +539,7 @@ def _call(path: str, data, content_type, relay_key=None, consumes_quota=True):
             resp = _open(path, data, content_type, KEYS[tier])
         except urllib.error.HTTPError as exc:
             body = exc.read()
-            last = _UpstreamError(exc.code, body, exc.headers.get("Content-Type"))
+            last = _UpstreamError(exc.code, _redact_body(body), exc.headers.get("Content-Type"))
             if _is_quota(exc.code, body):
                 if not _set_latch(tier, True):
                     _log(f"tier {tier} exhausted ({exc.code}) - failing over")
@@ -622,7 +636,7 @@ def _call_login(path: str, data, content_type):
             resp = _open_login(path, data, content_type, LOGINS[tier])
         except urllib.error.HTTPError as exc:
             body = exc.read()
-            last = _UpstreamError(exc.code, body, exc.headers.get("Content-Type"))
+            last = _UpstreamError(exc.code, _redact_body(body), exc.headers.get("Content-Type"))
             if exc.code not in LOGIN_FAILOVER_CODES:
                 # The request itself is at fault (bad audio, too large...): the
                 # other account would refuse it identically, and this one is fine.
