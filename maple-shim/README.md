@@ -194,6 +194,19 @@ Kata VM (`kata-run --cwd maple-shim -- …`), never on a laptop.
 
 ## Deploys
 
+- **2026-11-16 — from git again: login mode, redaction, fresh base.** `build-image.sh`
+  at main `2729e6f` (full base rebuild, `python:3.15-slim` `sha256:65a65fc7…` from
+  Renovate !7, Python 3.15.2) gave `host-maple-shim:repo-20261116` (`5a1ed50f`). The
+  base still had `zlib1g …-1+b1`, so `refresh-layer.sh` added one layer
+  (`+deb13u1`, the fix the live image already had):
+  `docker.io/kata/host-maple-shim:repo-20261116-refresh` (`sha256:ec957d0e…`).
+  `build-ca-layer.sh`: neither eMudhra root. Tests first (Kata, CPython 3.15.2):
+  `test_order` 6/6, `test_logins` 8/8, `tests-failover.sh` 19/19, `tests-login.sh`
+  26/26. Switched 04:37Z by a guarded retag: up in 31 s, guest `maple-shim.py`
+  sha256 `0cd59f88` = this repo's. A TTS→STT round trip through the shim with a
+  throwaway token returned the spoken sentence. Rollback:
+  `ctr -n default image tag --force docker.io/kata/host-maple-shim:pre-repo-20261116
+  docker.io/kata/host-maple-shim:migrated`, then restart (`b467d484`, the 11-10 build).
 - **2026-11-10 — transcription account login** (recorded 2026-11-16: the source
   stayed in ubuntu-server `/root/staging/maple-shim-login/` until then).
   `shim-derive-build.sh` swapped only `maple-shim.py` into the deployed

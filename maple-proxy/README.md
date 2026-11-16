@@ -187,18 +187,33 @@ until it lands; 2026-11-03), then:
     sudo /opt/sovtech-infra/kata/gen-kata-units.sh --install
     sudo systemctl restart kata-maple-proxy
 
-**Rollback.** The previous image stays imported as
-`docker.io/kata/maple-proxy-0.4.5-audio:migrated` (`sha256:e93e5211…`, the image
-the unit ran from 2026-11-03 to 2026-11-06). Quick rollback (keeps the unit on the
-new alias): `ctr -n default image tag --force
-docker.io/kata/maple-proxy-0.4.5-audio:migrated
-docker.io/kata/maple-proxy-0.5.0-audio:migrated` and restart. Clean rollback:
-revert the tsv row, pull, `gen-kata-units.sh --install`, restart. `ctr` renders
+**Rollback.** Within one alias, a rebuild is a retag, so the previous build stays
+imported under a `pre-…` tag of the same alias. Since 2026-11-16 that is
+`docker.io/kata/maple-proxy-0.5.0-audio:pre-repo-20261116` (`sha256:d803f535…`,
+the 2026-11-10 build): `ctr -n default image tag --force
+docker.io/kata/maple-proxy-0.5.0-audio:pre-repo-20261116
+docker.io/kata/maple-proxy-0.5.0-audio:migrated` and restart. Across a version
+change (a new alias), the old alias's image stays imported too
+(`maple-proxy-0.4.5-audio:migrated`, `sha256:e93e5211…`). Retag it onto the new
+alias for a quick rollback, or for a clean one: revert the tsv row, pull,
+`gen-kata-units.sh --install`, restart. Drop the audio patch and both shim audio
+paths 404 again; drop the transcription patch and transcription 403s. `ctr` renders
 the hyphen in a ref as a space in its own output — never parse that output for
 a ref.
 
 ## Deploys
 
+- **2026-11-16 — 0.5.0-audio from git, both patches, fresh runtime.** `build-image.sh`
+  at maple-shim main `2729e6f`, `SRC` = monorepo `c760e5b8`, runtime
+  `debian:bookworm-slim` `sha256:734a72b3…` (Renovate !6) + apt upgrade:
+  `docker.io/kata/maple-proxy-0.5.0-audio:repo-20261116` (`sha256:411b818e…`).
+  `refresh-layer.sh`: nothing to update; `build-ca-layer.sh`: neither eMudhra root.
+  Tests first (Kata): `cargo test --locked` 44 + 5 passed, `cargo fmt --check` and
+  clippy clean. Switched 04:36Z by a guarded retag under the same alias: up in 29 s,
+  probes as the baseline plus the login handler live (password-only → 400) and
+  `/v1/audio/translations` → 404. Rollback: `ctr -n default image tag --force
+  docker.io/kata/maple-proxy-0.5.0-audio:pre-repo-20261116
+  docker.io/kata/maple-proxy-0.5.0-audio:migrated`, then restart (`d803f535`, the 11-10 build).
 - **2026-11-10 — 0.5.0-audio + transcription-session.patch** (recorded
   2026-11-16: the source stayed in ubuntu-server `/root/staging/maple-0.5.0-session/`
   until then). Same `c760e5b8` and pins as 11-06, plus the patch.
