@@ -52,6 +52,7 @@ for t in ctr jq tar gzip sha256sum python3 git curl; do
 done
 [ -n "$SRC" ] && [ -d "$SRC/proxy/src" ] || { echo "!! SRC must point at a monorepo checkout containing proxy/ (got '$SRC')" >&2; exit 1; }
 [ -f "$HERE/audio-endpoints.patch" ] || { echo "!! missing $HERE/audio-endpoints.patch" >&2; exit 1; }
+[ -f "$HERE/transcription-session.patch" ] || { echo "!! missing $HERE/transcription-session.patch" >&2; exit 1; }
 # The version names the image; read it from [package], never trust a stale constant.
 VER=$(awk '/^\[/{p=($0=="[package]")} p && /^version *= *"/{gsub(/.*= *"|".*/,""); print; exit}' "$SRC/proxy/Cargo.toml")
 case "$VER" in [0-9]*.[0-9]*.[0-9]*) ;; *) echo "!! no [package] version in $SRC/proxy/Cargo.toml (got '$VER')" >&2; exit 1 ;; esac
@@ -176,6 +177,10 @@ cp "$SRC/proxy/Cargo.toml" "$SRC/proxy/Cargo.lock" "$W/build/proxy/"
 cp -a "$SRC/proxy/src" "$W/build/proxy/src"
 ( cd "$W/build/proxy" && git apply "$HERE/audio-endpoints.patch" )
 grep -q '/v1/audio/speech' "$W/build/proxy/src/lib.rs" || { echo "!! patch did not apply (no audio route in lib.rs)" >&2; exit 1; }
+# transcription-session.patch: the enclave refuses API keys on /v1/audio/transcriptions
+# (transcription_app_only), so this route logs in as a Maple account named by X-Maple-Login-* headers.
+( cd "$W/build/proxy" && git apply "$HERE/transcription-session.patch" )
+grep -q 'proxy_transcription_request' "$W/build/proxy/src/lib.rs" || { echo "!! transcription-session.patch did not apply" >&2; exit 1; }
 if [ "$SDK" = yes ]; then
     cp "$SRC/sdk/rust/Cargo.toml" "$W/build/sdk/rust/"
     cp -a "$SRC/sdk/rust/src" "$SRC/sdk/rust/assets" "$W/build/sdk/rust/"
@@ -272,7 +277,7 @@ config = {
             "WorkingDir":"/app","User":"maple",
             "ExposedPorts":{"8080/tcp":{}},
             "Labels":{"org.opencontainers.image.base.digest":base,
-                      "org.opencontainers.image.description":f"maple-proxy {ver} + audio-endpoints.patch",
+                      "org.opencontainers.image.description":f"maple-proxy {ver} + audio-endpoints.patch + transcription-session.patch",
                       "org.opencontainers.image.source":"https://github.com/MaplePrivacyLabs/Maple",
                       "org.opencontainers.image.revision":rev,
                       "org.opencontainers.image.version":ver}},

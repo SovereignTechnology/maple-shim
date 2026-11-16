@@ -59,6 +59,7 @@ import json
 import os
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
@@ -168,6 +169,10 @@ def _redact(text: str) -> str:
     for value in (globals().get("KEYS") or {}).values():
         if value and value in text:
             text = text.replace(value, "<redacted>")
+    for login in (globals().get("LOGINS") or {}).values():
+        value = login.get("password")
+        if value and value in text:
+            text = text.replace(value, "<redacted>")
     return text
 
 
@@ -201,6 +206,61 @@ def _load_keys() -> dict:
 
 
 KEYS = _load_keys()
+
+
+def _load_logins() -> dict:
+    """Maple ACCOUNT LOGINS, one per tier, for the endpoints the enclave will
+    not serve to an API key.
+
+    POST /v1/audio/transcriptions answers `transcription_app_only` (403) to
+    anything but a user JWT on a paid plan (enclave source, web/openai.rs
+    transcription_access: auth_method must be Jwt). So transcription cannot
+    ride MAPLE_KEY_*; the proxy logs in as a real account instead and we hand
+    it the login per request, exactly as we hand it the key for everything else.
+
+    keys.env names, per tier MAX / PRO:
+        MAPLE_LOGIN_<TIER>_EMAIL    a normal account, identified by e-mail
+        MAPLE_LOGIN_<TIER>_ID       a private/guest account: no e-mail, a UUID
+        MAPLE_LOGIN_<TIER>_PASSWORD
+    A tier needs a password and exactly one of EMAIL / ID. A tier with an
+    incomplete login is skipped with a log line, never half-used. Unlike the
+    keys, having none is NOT fatal: transcription then behaves as it always
+    did (relayed with the API key, and refused by the enclave).
+    """
+    creds = os.environ.get("CREDENTIALS_DIRECTORY")
+    path = os.path.join(creds, "maple-keys") if creds else "/etc/maple-shim/keys.env"
+    raw: dict = {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, _, value = line.partition("=")
+                raw[name.strip()] = value.strip().strip('"').strip("'")
+    except OSError:
+        return {}  # _load_keys already treated an unreadable file as fatal
+    logins: dict = {}
+    for tier in TIER_ORDER:
+        up = tier.upper()
+        email = raw.get(f"MAPLE_LOGIN_{up}_EMAIL", "")
+        ident = raw.get(f"MAPLE_LOGIN_{up}_ID", "")
+        password = raw.get(f"MAPLE_LOGIN_{up}_PASSWORD", "")
+        if not (email or ident or password):
+            continue
+        if not password or bool(email) == bool(ident):
+            _log(
+                f"login for tier {tier} ignored: needs MAPLE_LOGIN_{up}_PASSWORD "
+                f"and exactly one of MAPLE_LOGIN_{up}_EMAIL / MAPLE_LOGIN_{up}_ID"
+            )
+            continue
+        logins[tier] = {"password": password}
+        logins[tier]["email" if email else "id"] = email or ident
+    _log(f"loaded logins for tiers: {','.join(sorted(logins)) or 'none'}")
+    return logins
+
+
+LOGINS = _load_logins()
 
 _tokens: dict = {}
 _tokens_mtime = -1.0
@@ -500,6 +560,91 @@ def _call(path: str, data, content_type, relay_key=None, consumes_quota=True):
     raise _UpstreamError(503, b'{"error":"no maple key configured"}', "application/json")
 
 
+# --- account-login mode (transcription) ------------------------------------
+#
+# Deliberately separate from _call: that function's latch / cooldown / last_error
+# state in state.json describes CHAT quota per plan, and a transcription refusal
+# says nothing about it (the enclave bills transcription to the plan, not to chat
+# credits). Writing it there would demote a healthy chat tier, or clear a real
+# latch. Login mode keeps a small in-memory cooldown of its own instead.
+
+# A refusal that is about the ACCOUNT, not about the request: try the other one.
+# 503 = "that account already has a transcription running" (one per user).
+# 504 is absent on purpose: a timeout may mean the audio WAS processed, and
+# replaying it on the other account would bill it twice.
+LOGIN_FAILOVER_CODES = {401, 402, 403, 429, 502, 503}
+# Of those, the ones that say the account itself is unusable right now.
+LOGIN_COOLDOWN_CODES = {401, 402, 403, 429}
+
+_login_cooldown: dict = {}
+_login_cooldown_lock = threading.Lock()
+
+
+def _login_cooled(tier: str) -> bool:
+    with _login_cooldown_lock:
+        return _login_cooldown.get(tier, 0.0) > time.monotonic()
+
+
+def _login_cool(tier: str) -> None:
+    with _login_cooldown_lock:
+        _login_cooldown[tier] = time.monotonic() + COOLDOWN_SECONDS
+
+
+def _login_uncool(tier: str) -> bool:
+    with _login_cooldown_lock:
+        return _login_cooldown.pop(tier, None) is not None
+
+
+def _open_login(path: str, data, content_type, login: dict):
+    headers = {
+        "X-Maple-Login-Password": login["password"],
+        "User-Agent": "maple-shim/0.2",
+    }
+    if "email" in login:
+        headers["X-Maple-Login-Email"] = login["email"]
+    else:
+        headers["X-Maple-Login-Id"] = login["id"]
+    if content_type:
+        headers["Content-Type"] = content_type
+    req = urllib.request.Request(UPSTREAM + path, data=data, headers=headers)
+    return urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT)
+
+
+def _call_login(path: str, data, content_type):
+    """Like _call, but authenticating as an account login instead of an API key.
+    Max is preferred; a tier serving a cooldown is tried last, not never, so a
+    stale cooldown costs one wasted round trip instead of an outage. Returns
+    (tier, response)."""
+    order = sorted((t for t in TIER_ORDER if LOGINS.get(t)), key=_login_cooled)
+    last = None
+    for tier in order:
+        try:
+            resp = _open_login(path, data, content_type, LOGINS[tier])
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            last = _UpstreamError(exc.code, body, exc.headers.get("Content-Type"))
+            if exc.code not in LOGIN_FAILOVER_CODES:
+                # The request itself is at fault (bad audio, too large...): the
+                # other account would refuse it identically, and this one is fine.
+                raise last
+            if exc.code in LOGIN_COOLDOWN_CODES:
+                _login_cool(tier)
+            detail = _redact(body[:200].decode("utf-8", "replace").strip())
+            _log(f"transcription login {tier} refused with {exc.code}: {detail!r} - trying next")
+            continue
+        except urllib.error.URLError as exc:
+            _log(f"transcription login {tier} unreachable: {_redact(str(exc.reason))} - trying next")
+            last = _UpstreamError(502, b'{"error":"upstream unreachable"}', "application/json")
+            continue
+        if _login_uncool(tier):
+            _log(f"transcription login {tier} answering again - cooldown cleared")
+        return tier, resp
+    if last is not None:
+        _log("every transcription login refused")
+        raise last
+    raise _UpstreamError(503, b'{"error":"no maple login configured"}', "application/json")
+
+
 def _guess_content_type(filename: str, declared: str | None) -> str:
     if declared and declared not in ("application/octet-stream", "text/plain"):
         return declared
@@ -667,6 +812,13 @@ class Handler(BaseHTTPRequestHandler):
                 "active_tier": order[0] if order else None,
                 "strict": STRICT,
                 "tiers": tiers,
+                "transcription": {
+                    tier: {
+                        "login_configured": bool(LOGINS.get(tier)),
+                        "cooling_down": _login_cooled(tier),
+                    }
+                    for tier in TIER_ORDER
+                },
             },
         )
 
@@ -817,12 +969,12 @@ class Handler(BaseHTTPRequestHandler):
                 415, {"error": "expected multipart/form-data or application/json"}
             )
             return
-        _tier, resp = _call(
-            "/audio/transcriptions",
-            json.dumps(payload).encode(),
-            "application/json",
-            relay_key,
-        )
+        data = json.dumps(payload).encode()
+        if relay_key is None and LOGINS:
+            # Token client: the enclave refuses API keys here, so use a login.
+            _tier, resp = _call_login("/audio/transcriptions", data, "application/json")
+        else:
+            _tier, resp = _call("/audio/transcriptions", data, "application/json", relay_key)
         with resp:
             self._reply(
                 200,

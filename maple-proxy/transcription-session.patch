@@ -1,0 +1,442 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 38a0de8..9b58f5d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1542,6 +1542,7 @@ dependencies = [
+  "tower-http",
+  "tracing",
+  "tracing-subscriber",
++ "uuid",
+ ]
+ 
+ [[package]]
+diff --git a/Cargo.toml b/Cargo.toml
+index eeebd16..56bf237 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -57,6 +57,9 @@ anyhow = "1.0.103"
+ # HTTP types and headers
+ http = "1.0"
+ 
++# Account-login identifiers (login_with_id takes a Uuid; maple-sdk does not re-export it)
++uuid = "1.11"
++
+ [dev-dependencies]
+ axum-test = "18.0.1"
+ tokio = { version = "1.47", features = ["test-util"] }
+diff --git a/src/config.rs b/src/config.rs
+index 63e1314..982a094 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -229,6 +229,10 @@ impl OpenAIError {
+     pub(crate) fn server_error(message: impl Into<String>) -> Self {
+         Self::new(message, "server_error")
+     }
++
++    pub(crate) fn invalid_request_error(message: impl Into<String>) -> Self {
++        Self::new(message, "invalid_request_error")
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/lib.rs b/src/lib.rs
+index 244ebfb..50cd6a3 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -3,7 +3,7 @@ mod proxy;
+ 
+ pub use config::Config;
+ pub use maple_sdk::{ClientApp, Pcr0Environment};
+-use proxy::{health_check, proxy_openai_request, ProxyState};
++use proxy::{health_check, proxy_openai_request, proxy_transcription_request, ProxyState};
+ 
+ use axum::{
+     extract::DefaultBodyLimit,
+@@ -38,7 +38,7 @@ pub(crate) fn create_app_with_state(config: Config, state: Arc<ProxyState>) -> R
+         .route("/v1/embeddings", post(proxy_openai_request))
+         .route("/v1/systemone", post(proxy_openai_request))
+         .route("/v1/audio/speech", post(proxy_openai_request))
+-        .route("/v1/audio/transcriptions", post(proxy_openai_request))
++        .route("/v1/audio/transcriptions", post(proxy_transcription_request))
+         .with_state(state)
+         .layer(
+             ServiceBuilder::new()
+diff --git a/src/proxy.rs b/src/proxy.rs
+index b714efd..0fe0c06 100644
+--- a/src/proxy.rs
++++ b/src/proxy.rs
+@@ -8,11 +8,21 @@ use axum::{
+ };
+ use futures::{future::BoxFuture, Stream, StreamExt};
+ use maple_sdk::{
+-    client::OpenSecretResponseBody, ClientApp, OpenSecretClient, Result as OpenSecretResult,
+-    TransportV2CacheNamespaceRoot,
++    client::OpenSecretResponseBody, ClientApp, Error as SdkError, OpenSecretClient,
++    Result as OpenSecretResult, TransportV2CacheNamespaceRoot,
+ };
+-use std::{collections::HashSet, io, pin::Pin, sync::Arc, time::Duration};
+-use tokio::{sync::OnceCell, time::Instant};
++use std::{
++    collections::{HashMap, HashSet},
++    io,
++    pin::Pin,
++    sync::Arc,
++    time::Duration,
++};
++use tokio::{
++    sync::{Mutex, OnceCell},
++    time::Instant,
++};
++use uuid::Uuid;
+ use tracing::{debug, error, warn};
+ 
+ type ProxyError = (StatusCode, Json<OpenAIError>);
+@@ -41,6 +51,8 @@ pub(crate) struct ProxyState {
+     config: Config,
+     client: OnceCell<Arc<OpenSecretClient>>,
+     transport_override: Option<Arc<dyn InferenceTransport>>,
++    /// Logged-in account sessions, for the routes the enclave refuses to API keys.
++    sessions: LoginSessions,
+ }
+ 
+ impl ProxyState {
+@@ -49,6 +61,7 @@ impl ProxyState {
+             config,
+             client: OnceCell::new(),
+             transport_override: None,
++            sessions: LoginSessions::default(),
+         }
+     }
+ 
+@@ -58,6 +71,7 @@ impl ProxyState {
+             config,
+             client: OnceCell::new(),
+             transport_override: Some(transport),
++            sessions: LoginSessions::default(),
+         }
+     }
+ 
+@@ -259,6 +273,9 @@ fn is_unsafe_request_header(name: &HeaderName) -> bool {
+     matches!(
+         name.as_str(),
+         "authorization"
++            | LOGIN_EMAIL_HEADER
++            | LOGIN_ID_HEADER
++            | LOGIN_PASSWORD_HEADER
+             | "cookie"
+             | "set-cookie"
+             | "accept-encoding"
+@@ -391,6 +408,313 @@ fn stream_with_timeouts(
+     })
+ }
+ 
++// ---------------------------------------------------------------------------
++// Account-login mode (POST /v1/audio/transcriptions)
++//
++// The enclave serves transcription only to a logged-in user JWT on a paid plan
++// and answers API keys with 403 `transcription_app_only` (enclave source,
++// services/opensecret/src/web/openai.rs `transcription_access`). Everything else
++// this proxy forwards authenticates with a per-request API key, so for this one
++// route the caller (maple-shim) instead names an ACCOUNT in headers and the
++// proxy logs in as it, using the SDK's own `login` / `login_with_id`.
++//
++//   X-Maple-Login-Email     a normal account, or
++//   X-Maple-Login-Id        a private/guest account (a UUID, no e-mail)
++//   X-Maple-Login-Password  required with either
++//
++// One attested client + session per account, kept in memory only: the password
++// is held for the life of the process (it is sent on every request anyway) and
++// is never logged, never forwarded upstream, and never part of a Debug impl.
++// A request without these headers behaves exactly as before.
++// ---------------------------------------------------------------------------
++
++const LOGIN_EMAIL_HEADER: &str = "x-maple-login-email";
++const LOGIN_ID_HEADER: &str = "x-maple-login-id";
++const LOGIN_PASSWORD_HEADER: &str = "x-maple-login-password";
++
++/// Maple's public application client id (the one the Maple apps log in with;
++/// maple-agent's release profiles). Override with MAPLE_CLIENT_ID.
++const DEFAULT_LOGIN_CLIENT_ID: Uuid = Uuid::from_u128(0xba5a14b5_d915_47b1_b7b1_afda52bc5fc6);
++
++#[derive(Clone, PartialEq, Eq, Hash)]
++enum LoginIdent {
++    Email(String),
++    Id(Uuid),
++}
++
++/// Deliberately no `Debug`: the password must not be printable by accident.
++#[derive(Clone)]
++struct LoginCredentials {
++    ident: LoginIdent,
++    password: String,
++}
++
++struct SessionEntry {
++    client: Arc<OpenSecretClient>,
++    password: String,
++}
++
++#[derive(Default)]
++struct LoginSessions {
++    slots: Mutex<HashMap<LoginIdent, Arc<Mutex<Option<SessionEntry>>>>>,
++}
++
++impl LoginSessions {
++    async fn slot(&self, ident: &LoginIdent) -> Arc<Mutex<Option<SessionEntry>>> {
++        let mut slots = self.slots.lock().await;
++        Arc::clone(slots.entry(ident.clone()).or_default())
++    }
++}
++
++fn login_client_id() -> Uuid {
++    std::env::var("MAPLE_CLIENT_ID")
++        .ok()
++        .and_then(|value| Uuid::parse_str(value.trim()).ok())
++        .unwrap_or(DEFAULT_LOGIN_CLIENT_ID)
++}
++
++fn header_text(headers: &HeaderMap, name: &str) -> Result<Option<String>, OpenAIError> {
++    match headers.get(name) {
++        None => Ok(None),
++        Some(value) => value
++            .to_str()
++            .map(|text| Some(text.trim().to_owned()))
++            .map_err(|_| OpenAIError::invalid_request_error(format!("Invalid {name} header"))),
++    }
++}
++
++/// `Ok(None)` when the request names no account (plain API-key behaviour).
++fn extract_login(headers: &HeaderMap) -> Result<Option<LoginCredentials>, OpenAIError> {
++    let email = header_text(headers, LOGIN_EMAIL_HEADER)?.filter(|v| !v.is_empty());
++    let id = header_text(headers, LOGIN_ID_HEADER)?.filter(|v| !v.is_empty());
++    let password = header_text(headers, LOGIN_PASSWORD_HEADER)?.filter(|v| !v.is_empty());
++
++    let ident = match (email, id) {
++        (None, None) => {
++            return match password {
++                None => Ok(None),
++                Some(_) => Err(OpenAIError::invalid_request_error(
++                    "A login password was sent without an account identifier",
++                )),
++            };
++        }
++        (Some(email), None) => LoginIdent::Email(email),
++        (None, Some(id)) => LoginIdent::Id(Uuid::parse_str(&id).map_err(|_| {
++            OpenAIError::invalid_request_error("X-Maple-Login-Id is not a valid UUID")
++        })?),
++        (Some(_), Some(_)) => {
++            return Err(OpenAIError::invalid_request_error(
++                "Send either an e-mail or an account id, not both",
++            ));
++        }
++    };
++    let password = password.ok_or_else(|| {
++        OpenAIError::invalid_request_error("An account identifier was sent without a password")
++    })?;
++    Ok(Some(LoginCredentials { ident, password }))
++}
++
++impl ProxyState {
++    /// The logged-in client for this account, logging in (once) if needed.
++    /// Logins for one account are serialised; different accounts do not block
++    /// each other. A changed password replaces the cached session.
++    async fn login_client(
++        &self,
++        login: &LoginCredentials,
++    ) -> Result<Arc<OpenSecretClient>, ProxyError> {
++        let slot = self.sessions.slot(&login.ident).await;
++        let mut guard = slot.lock().await;
++        if let Some(entry) = guard.as_ref() {
++            if entry.password == login.password {
++                return Ok(Arc::clone(&entry.client));
++            }
++        }
++        *guard = None;
++
++        let request_timeout = self.config.request_timeout();
++        let client = create_shared_client(
++            &self.config.backend_url,
++            self.config.pcr0_environment,
++            request_timeout,
++            self.config.cache_namespace_root.clone(),
++            self.config.client_app,
++        )
++        .await?;
++
++        let client_id = login_client_id();
++        let password = login.password.clone();
++        let attempt = async {
++            match &login.ident {
++                LoginIdent::Email(email) => client.login(email.clone(), password, client_id).await,
++                LoginIdent::Id(id) => client.login_with_id(*id, password, client_id).await,
++            }
++        };
++        match tokio::time::timeout(request_timeout, attempt).await {
++            Err(_) => return Err(timeout_response("Maple account login", request_timeout)),
++            Ok(Err(SdkError::Api { status, .. })) if matches!(status, 400 | 401 | 403 | 404) => {
++                // Do not echo the backend's message: it is about a credential.
++                warn!("Maple account login was rejected (HTTP {status})");
++                return Err((
++                    StatusCode::UNAUTHORIZED,
++                    Json(OpenAIError::authentication_error("Maple account login rejected")),
++                ));
++            }
++            Ok(Err(error)) => return Err(transport_error_response("Maple account login", &error)),
++            Ok(Ok(_)) => {}
++        }
++
++        let client = Arc::new(client);
++        *guard = Some(SessionEntry {
++            client: Arc::clone(&client),
++            password: login.password.clone(),
++        });
++        Ok(client)
++    }
++
++    /// Forget a session the backend stopped accepting -- but only if it is still
++    /// the one that failed, so a concurrent request's fresh login is not discarded.
++    async fn invalidate_login(&self, ident: &LoginIdent, failed: &Arc<OpenSecretClient>) {
++        let slot = self.sessions.slot(ident).await;
++        let mut guard = slot.lock().await;
++        if guard
++            .as_ref()
++            .is_some_and(|entry| Arc::ptr_eq(&entry.client, failed))
++        {
++            *guard = None;
++        }
++    }
++}
++
++/// `POST /v1/audio/transcriptions`: as an account when the request names one,
++/// otherwise exactly [`proxy_openai_request`].
++pub(crate) async fn proxy_transcription_request(
++    State(state): State<Arc<ProxyState>>,
++    OriginalUri(uri): OriginalUri,
++    method: Method,
++    headers: HeaderMap,
++    body: Bytes,
++) -> Result<Response, ProxyError> {
++    let login = extract_login(&headers).map_err(|e| (StatusCode::BAD_REQUEST, Json(e)))?;
++    let Some(login) = login else {
++        return proxy_openai_request(State(state), OriginalUri(uri), method, headers, body).await;
++    };
++
++    debug!("Proxying {} {} as a logged-in account", method, uri.path());
++    let request_timeout = state.config.request_timeout();
++    let request_deadline = tokio::time::sleep(request_timeout).deadline();
++
++    let mut client = state.login_client(&login).await?;
++    // At most one re-login: the SDK refreshes an expiring access token itself,
++    // so a 401 here means the session is gone (or the password changed).
++    for attempt in 0..2 {
++        let request = build_upstream_request(method.clone(), uri.clone(), &headers, body.clone());
++        let outcome = tokio::time::timeout_at(request_deadline, client.send_inference_request(request))
++            .await
++            .map_err(|_| timeout_response("OpenAI-compatible request", request_timeout))?;
++        let session_gone = match &outcome {
++            Ok(response) => response.status() == StatusCode::UNAUTHORIZED,
++            Err(SdkError::Api { status, .. }) => *status == 401,
++            Err(_) => false,
++        };
++        if session_gone && attempt == 0 {
++            warn!("Maple account session was rejected; logging in again");
++            state.invalidate_login(&login.ident, &client).await;
++            client = state.login_client(&login).await?;
++            continue;
++        }
++        let response = outcome
++            .map_err(|error| transport_error_response("OpenSecret inference request", &error))?;
++        return Ok(build_downstream_response(
++            response,
++            state.config.stream_idle_timeout(),
++            request_deadline,
++        ));
++    }
++    Err((
++        StatusCode::BAD_GATEWAY,
++        Json(OpenAIError::server_error(
++            "Failed to communicate securely with the Maple backend",
++        )),
++    ))
++}
++
++#[cfg(test)]
++mod login_tests {
++    use super::*;
++    use axum::http::HeaderValue;
++
++    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
++        let mut map = HeaderMap::new();
++        for (name, value) in pairs {
++            map.insert(*name, HeaderValue::from_str(value).unwrap());
++        }
++        map
++    }
++
++    const ID: &str = "3f2a9c1e-1b4d-4e6f-8a7b-0c1d2e3f4a5b";
++
++    #[test]
++    fn no_login_headers_means_api_key_behaviour() {
++        assert!(extract_login(&headers(&[])).unwrap().is_none());
++        assert!(extract_login(&headers(&[("authorization", "Bearer k")]))
++            .unwrap()
++            .is_none());
++    }
++
++    #[test]
++    fn email_and_private_account_logins_are_recognised() {
++        let by_email = extract_login(&headers(&[
++            (LOGIN_EMAIL_HEADER, "a@b.test"),
++            (LOGIN_PASSWORD_HEADER, "pw"),
++        ]))
++        .unwrap()
++        .unwrap();
++        assert!(by_email.ident == LoginIdent::Email("a@b.test".into()) && by_email.password == "pw");
++
++        let by_id = extract_login(&headers(&[(LOGIN_ID_HEADER, ID), (LOGIN_PASSWORD_HEADER, "pw")]))
++            .unwrap()
++            .unwrap();
++        assert!(by_id.ident == LoginIdent::Id(Uuid::parse_str(ID).unwrap()));
++    }
++
++    #[test]
++    fn malformed_logins_are_rejected_not_guessed() {
++        let bad = |pairs: &[(&'static str, &str)]| extract_login(&headers(pairs)).is_err();
++        assert!(bad(&[(LOGIN_PASSWORD_HEADER, "pw")]), "password alone");
++        assert!(bad(&[(LOGIN_EMAIL_HEADER, "a@b.test")]), "identifier alone");
++        assert!(bad(&[(LOGIN_ID_HEADER, "not-a-uuid"), (LOGIN_PASSWORD_HEADER, "pw")]));
++        assert!(bad(&[
++            (LOGIN_EMAIL_HEADER, "a@b.test"),
++            (LOGIN_ID_HEADER, ID),
++            (LOGIN_PASSWORD_HEADER, "pw"),
++        ]));
++    }
++
++    #[test]
++    fn login_headers_are_never_forwarded_upstream() {
++        let source = headers(&[
++            (LOGIN_EMAIL_HEADER, "a@b.test"),
++            (LOGIN_ID_HEADER, ID),
++            (LOGIN_PASSWORD_HEADER, "pw"),
++            ("content-type", "application/json"),
++        ]);
++        let mut forwarded = HeaderMap::new();
++        copy_safe_request_headers(&source, &mut forwarded);
++        assert!(forwarded.get(LOGIN_EMAIL_HEADER).is_none());
++        assert!(forwarded.get(LOGIN_ID_HEADER).is_none());
++        assert!(forwarded.get(LOGIN_PASSWORD_HEADER).is_none());
++        assert!(forwarded.get("content-type").is_some());
++    }
++
++    #[test]
++    fn the_default_client_id_is_the_published_maple_one() {
++        assert_eq!(
++            DEFAULT_LOGIN_CLIENT_ID.to_string(),
++            "ba5a14b5-d915-47b1-b7b1-afda52bc5fc6"
++        );
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
