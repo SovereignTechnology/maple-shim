@@ -1,5 +1,5 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index b4b6649..d0419f0 100644
+index d304069a..244ebfba 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -37,6 +37,8 @@ pub(crate) fn create_app_with_state(config: Config, state: Arc<ProxyState>) -> R
@@ -11,3 +11,23 @@ index b4b6649..d0419f0 100644
          .with_state(state)
          .layer(
              ServiceBuilder::new()
+diff --git a/src/proxy.rs b/src/proxy.rs
+index b714efdc..1f2989ad 100644
+--- a/src/proxy.rs
++++ b/src/proxy.rs
+@@ -1076,12 +1076,14 @@ mod tests {
+ 
+     #[tokio::test]
+     async fn routes_outside_the_explicit_proxy_surface_are_not_forwarded() {
++        // SovTech audio-endpoints.patch routes exactly /v1/audio/speech and
++        // /v1/audio/transcriptions; every other path, audio ones included, stays unrouted.
+         let transport = Arc::new(MockTransport::new(Vec::new()));
+         let response = mock_app(Arc::clone(&transport))
+             .oneshot(
+                 AxumRequest::builder()
+                     .method(Method::POST)
+-                    .uri("/v1/audio/speech")
++                    .uri("/v1/audio/translations")
+                     .body(Body::from("opaque"))
+                     .unwrap(),
+             )

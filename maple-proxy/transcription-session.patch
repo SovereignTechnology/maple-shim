@@ -40,7 +40,7 @@ index 63e13140..982a094f 100644
  
  #[cfg(test)]
 diff --git a/src/lib.rs b/src/lib.rs
-index 244ebfba..50cd6a30 100644
+index 244ebfba..162cd809 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -3,7 +3,7 @@ mod proxy;
@@ -52,20 +52,23 @@ index 244ebfba..50cd6a30 100644
  
  use axum::{
      extract::DefaultBodyLimit,
-@@ -38,7 +38,7 @@ pub(crate) fn create_app_with_state(config: Config, state: Arc<ProxyState>) -> R
+@@ -38,7 +38,10 @@ pub(crate) fn create_app_with_state(config: Config, state: Arc<ProxyState>) -> R
          .route("/v1/embeddings", post(proxy_openai_request))
          .route("/v1/systemone", post(proxy_openai_request))
          .route("/v1/audio/speech", post(proxy_openai_request))
 -        .route("/v1/audio/transcriptions", post(proxy_openai_request))
-+        .route("/v1/audio/transcriptions", post(proxy_transcription_request))
++        .route(
++            "/v1/audio/transcriptions",
++            post(proxy_transcription_request),
++        )
          .with_state(state)
          .layer(
              ServiceBuilder::new()
 diff --git a/src/proxy.rs b/src/proxy.rs
-index b714efdc..727d85a4 100644
+index 1f2989ad..52c23134 100644
 --- a/src/proxy.rs
 +++ b/src/proxy.rs
-@@ -8,11 +8,21 @@ use axum::{
+@@ -8,12 +8,22 @@ use axum::{
  };
  use futures::{future::BoxFuture, Stream, StreamExt};
  use maple_sdk::{
@@ -73,9 +76,7 @@ index b714efdc..727d85a4 100644
 -    TransportV2CacheNamespaceRoot,
 +    client::OpenSecretResponseBody, ClientApp, Error as SdkError, OpenSecretClient,
 +    Result as OpenSecretResult, TransportV2CacheNamespaceRoot,
- };
--use std::{collections::HashSet, io, pin::Pin, sync::Arc, time::Duration};
--use tokio::{sync::OnceCell, time::Instant};
++};
 +use std::{
 +    collections::{HashMap, HashSet},
 +    io,
@@ -86,11 +87,14 @@ index b714efdc..727d85a4 100644
 +use tokio::{
 +    sync::{Mutex, OnceCell},
 +    time::Instant,
-+};
-+use uuid::Uuid;
+ };
+-use std::{collections::HashSet, io, pin::Pin, sync::Arc, time::Duration};
+-use tokio::{sync::OnceCell, time::Instant};
  use tracing::{debug, error, warn};
++use uuid::Uuid;
  
  type ProxyError = (StatusCode, Json<OpenAIError>);
+ 
 @@ -41,6 +51,8 @@ pub(crate) struct ProxyState {
      config: Config,
      client: OnceCell<Arc<OpenSecretClient>>,
@@ -126,7 +130,7 @@ index b714efdc..727d85a4 100644
              | "cookie"
              | "set-cookie"
              | "accept-encoding"
-@@ -391,6 +408,402 @@ fn stream_with_timeouts(
+@@ -391,6 +408,423 @@ fn stream_with_timeouts(
      })
  }
  
@@ -317,7 +321,9 @@ index b714efdc..727d85a4 100644
 +                warn!("Maple account login was rejected (HTTP {status})");
 +                return Err((
 +                    StatusCode::UNAUTHORIZED,
-+                    Json(OpenAIError::authentication_error("Maple account login rejected")),
++                    Json(OpenAIError::authentication_error(
++                        "Maple account login rejected",
++                    )),
 +                ));
 +            }
 +            Ok(Err(error)) => return Err(transport_error_response("Maple account login", &error)),
@@ -364,9 +370,10 @@ index b714efdc..727d85a4 100644
 +    // so a 401 here means the session is gone (or the password changed).
 +    for attempt in 0..2 {
 +        let request = build_upstream_request(method.clone(), uri.clone(), &headers, body.clone());
-+        let outcome = tokio::time::timeout_at(request_deadline, client.send_inference_request(request))
-+            .await
-+            .map_err(|_| timeout_response("OpenAI-compatible request", request_timeout))?;
++        let outcome =
++            tokio::time::timeout_at(request_deadline, client.send_inference_request(request))
++                .await
++                .map_err(|_| timeout_response("OpenAI-compatible request", request_timeout))?;
 +        let session_gone = match &outcome {
 +            Ok(response) => response.status() == StatusCode::UNAUTHORIZED,
 +            Err(SdkError::Api { status, .. }) => *status == 401,
@@ -425,11 +432,16 @@ index b714efdc..727d85a4 100644
 +        ]))
 +        .unwrap()
 +        .unwrap();
-+        assert!(by_email.ident == LoginIdent::Email("a@b.test".into()) && by_email.password == "pw");
++        assert!(
++            by_email.ident == LoginIdent::Email("a@b.test".into()) && by_email.password == "pw"
++        );
 +
-+        let by_id = extract_login(&headers(&[(LOGIN_ID_HEADER, ID), (LOGIN_PASSWORD_HEADER, "pw")]))
-+            .unwrap()
-+            .unwrap();
++        let by_id = extract_login(&headers(&[
++            (LOGIN_ID_HEADER, ID),
++            (LOGIN_PASSWORD_HEADER, "pw"),
++        ]))
++        .unwrap()
++        .unwrap();
 +        assert!(by_id.ident == LoginIdent::Id(Uuid::parse_str(ID).unwrap()));
 +    }
 +
@@ -438,7 +450,10 @@ index b714efdc..727d85a4 100644
 +        let bad = |pairs: &[(&'static str, &str)]| extract_login(&headers(pairs)).is_err();
 +        assert!(bad(&[(LOGIN_PASSWORD_HEADER, "pw")]), "password alone");
 +        assert!(bad(&[(LOGIN_EMAIL_HEADER, "a@b.test")]), "identifier alone");
-+        assert!(bad(&[(LOGIN_ID_HEADER, "not-a-uuid"), (LOGIN_PASSWORD_HEADER, "pw")]));
++        assert!(bad(&[
++            (LOGIN_ID_HEADER, "not-a-uuid"),
++            (LOGIN_PASSWORD_HEADER, "pw")
++        ]));
 +        assert!(bad(&[
 +            (LOGIN_EMAIL_HEADER, "a@b.test"),
 +            (LOGIN_ID_HEADER, ID),
@@ -480,7 +495,10 @@ index b714efdc..727d85a4 100644
 +    async fn a_failed_login_leaves_no_slot_behind() {
 +        let state = unreachable_state();
 +        for n in 0..3 {
-+            assert!(state.login_client(&login(&format!("{n}@b.test"), "pw")).await.is_err());
++            assert!(state
++                .login_client(&login(&format!("{n}@b.test"), "pw"))
++                .await
++                .is_err());
 +        }
 +        assert!(state.sessions.slots.lock().await.is_empty());
 +    }
@@ -495,7 +513,10 @@ index b714efdc..727d85a4 100644
 +            password: "right".into(),
 +        });
 +
-+        assert!(state.login_client(&login("a@b.test", "wrong")).await.is_err());
++        assert!(state
++            .login_client(&login("a@b.test", "wrong"))
++            .await
++            .is_err());
 +
 +        let Ok(got) = state.login_client(&login("a@b.test", "right")).await else {
 +            panic!("a wrong password evicted the working session");
@@ -511,7 +532,11 @@ index b714efdc..727d85a4 100644
 +        let mine = sessions.slot(&ident).await;
 +        let theirs = sessions.slot(&ident).await;
 +        sessions.forget_if_unused(&ident, &mine).await;
-+        assert_eq!(sessions.slots.lock().await.len(), 1, "another request still holds it");
++        assert_eq!(
++            sessions.slots.lock().await.len(),
++            1,
++            "another request still holds it"
++        );
 +        drop(theirs);
 +        sessions.forget_if_unused(&ident, &mine).await;
 +        assert!(sessions.slots.lock().await.is_empty());

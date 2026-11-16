@@ -38,7 +38,9 @@ ourtranslate's voice path depend on these routes.
 **The patch is not optional and it is not a nicety.** Stock upstream has never
 routed audio at *any* version — 0.1.8, 0.1.11, 0.3.2 and the 0.4.x monorepo all
 have no audio route and no fallback (0.4.5's own tests assert that
-`/v1/audio/speech` is not forwarded). The handler is path-generic: it
+`/v1/audio/speech` is not forwarded; since 2026-11-16 the patch moves that test
+to `/v1/audio/translations`, which stays unrouted, so the patched tree's
+`cargo test --locked` passes: before that, one upstream test always failed). The handler is path-generic: it
 takes `OriginalUri` and forwards it verbatim, and the SDK's
 `is_allowed_inference_endpoint` already whitelists both audio paths. Routing
 them is the whole fix.
