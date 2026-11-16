@@ -1,4 +1,4 @@
-# maple-proxy: audio endpoint patch (upstream 0.5.0, monorepo)
+# maple-proxy: audio + transcription-session patches (upstream 0.5.0, monorepo)
 
 > **Upstream status (checked 2026-11-03).** The standalone
 > `OpenSecretCloud/maple-proxy` repo was **retired on 2026-09-08**; development
@@ -42,6 +42,42 @@ have no audio route and no fallback (0.4.5's own tests assert that
 takes `OriginalUri` and forwards it verbatim, and the SDK's
 `is_allowed_inference_endpoint` already whitelists both audio paths. Routing
 them is the whole fix.
+
+## transcription-session.patch: account login for transcription (since 2026-11-10)
+
+The enclave serves `POST /v1/audio/transcriptions` only to a **logged-in user
+JWT on a paid plan**; an API key gets `403 transcription_app_only` (enclave
+`web/openai.rs` `transcription_access`). Every other route here authenticates
+with a per-request key. So with this patch the transcriptions route logs in as
+the account the caller names in headers, using the SDK's own `login` /
+`login_with_id`:
+
+    X-Maple-Login-Email      a normal account, or
+    X-Maple-Login-Id         a private account (a UUID, no e-mail)
+    X-Maple-Login-Password   required with either
+
+A request without them behaves exactly as before (key, then the enclave's 403).
+maple-shim is the only caller that sends them (keys.env `MAPLE_LOGIN_*`, see its
+README). What the patch guarantees, and its unit tests check:
+
+- the three headers are on the unsafe-header list, so they are **never forwarded
+  upstream**;
+- the credentials type has no `Debug`, and a rejected login answers a bare
+  `401 Maple account login rejected` without echoing the backend's message;
+- one attested client and session per account, in memory only, so logins for one
+  account are serialised; a `401` mid-request logs in again, once;
+- since 2026-11-16: a **failed login leaves no entry behind**, so naming
+  accounts cannot grow the map, and a **wrong password never evicts a working
+  session**: the cached one is replaced only after the new password logs in.
+
+**Exposure.** The proxy API is reachable on the tailnet (Caddy `:62053`) and
+through the `maple-proxy api-multi` onion, not only from the shim. Anyone who
+reaches it could already use a key of their own, and now an account of their
+own. Each attempted login costs one attestation handshake plus one login call
+to the enclave, so the patch amplifies traffic toward Maple; it has no rate limit.
+
+It is applied after `audio-endpoints.patch` (it replaces that route's handler),
+and `build-image.sh` refuses to continue if either did not apply.
 
 ## Why it is an image now (incident, 2026-08-30)
 
@@ -91,7 +127,8 @@ ubuntu-server (dockerd is disabled by design; containerd is the runtime),
 mirroring upstream's Dockerfile in two chroot stages:
 
 1. builder `docker.io/library/rust:1.89.0-bookworm` — install `pkg-config
-   libssl-dev`, apply `audio-endpoints.patch` inside `proxy/`,
+   libssl-dev`, apply `audio-endpoints.patch` then `transcription-session.patch`
+   inside `proxy/`,
    `cargo build --locked --release --bin maple-proxy`;
 2. runtime `docker.io/library/debian:bookworm-slim` — `apt-get upgrade` first
    (the base lags the security pocket: the 0.4.1 image carried old perl-base,
@@ -160,6 +197,12 @@ a ref.
 
 ## Deploys
 
+- **2026-11-10 — 0.5.0-audio + transcription-session.patch** (recorded
+  2026-11-16: the source stayed in ubuntu-server `/root/staging/maple-0.5.0-session/`
+  until then). Same `c760e5b8` and pins as 11-06, plus the patch.
+  `docker.io/kata/maple-proxy-0.5.0-audio:session-20261110` (`sha256:d803f535…`),
+  retagged `:migrated` under the same alias, unit restarted 07:17Z. Rollback then:
+  `:pre-session-20261110` (`673f9535`, the 11-06 build).
 - **2026-11-06 — 0.5.0-audio.** Monorepo `c760e5b8` (the revision of upstream's
   0.5.0 image), patch unchanged, same builder and runtime pins as 0.4.5.
   `docker.io/kata/maple-proxy-0.5.0-audio:migrated` = `sha256:673f9535…`.
@@ -177,6 +220,9 @@ a ref.
 - **2026-09-02 — 0.3.2-audio.** Patched 0.3.2 (`sha256:b953e868…`).
 
 ## Contract
+
+Transcription additionally needs the `X-Maple-Login-*` headers described
+above; with only a key the enclave answers `403 transcription_app_only`.
 
 Both endpoints are JSON-in/JSON-out with the audio base64 inside the JSON —
 this is the *enclave's* contract, not OpenAI's. `maple-shim` translates it to

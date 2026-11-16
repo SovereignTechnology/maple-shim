@@ -40,11 +40,45 @@ Keys are delivered by systemd `LoadCredential=` from `/etc/maple-shim/keys.env`
 (0600 root). www-data never gets a readable copy on disk.
 
     /etc/maple-shim/keys.env    MAPLE_KEY_MAX=... / MAPLE_KEY_PRO=...   0600 root
+                                MAPLE_LOGIN_<TIER>_EMAIL|_ID, _PASSWORD  (transcription, below)
     /etc/maple-shim/tokens      "<token> <label> [flag...]" per line, on mtime
     /var/lib/maple-shim/state.json   quota latch (StateDirectory=)
 
 `MAPLE_SHIM_STRICT=1` rejects unknown tokens and logs the caller's IP. It is
 **on** (2026-09-01), so every client must hold a token from the table above.
+
+### Transcription needs an account login, not a key (since 2026-11-10)
+
+The enclave serves `POST /v1/audio/transcriptions` only to a **logged-in user
+JWT on a paid plan**. An API key gets `403 transcription_app_only` (enclave
+source, `web/openai.rs` `transcription_access`), so no key can do it. For this
+one route the shim authenticates as a Maple **account** instead, read from
+`keys.env` per tier:
+
+    MAPLE_LOGIN_MAX_EMAIL=...     or  MAPLE_LOGIN_MAX_ID=<uuid>   (a private account has no e-mail)
+    MAPLE_LOGIN_MAX_PASSWORD=...
+    MAPLE_LOGIN_PRO_EMAIL=...     or  MAPLE_LOGIN_PRO_ID=<uuid>
+    MAPLE_LOGIN_PRO_PASSWORD=...
+
+A tier needs a password and exactly one of `EMAIL`/`ID`. An incomplete tier is
+skipped with a log line and never half-used. Having no logins at all is not
+fatal: transcription then goes out with the key as before, and the enclave
+refuses it. The startup log line `loaded logins for tiers: …` says which
+tiers loaded. The shim sends the login to maple-proxy as
+`X-Maple-Login-{Email|Id,Password}` headers (the proxy's
+`transcription-session.patch` logs in and strips them), exactly the way it
+hands over a key everywhere else.
+
+Login mode is **deliberately separate from the chat latch**: a transcription
+refusal says nothing about chat quota, so it never writes `state.json`. It keeps
+its own in-memory cooldown instead. Max is tried first. Refusals of `401 402 403
+429 502 503` move to the other account (`503` = that account already has a
+transcription running). `400` and `504` do not: the request is at fault, or
+the audio may already have been processed and a replay would bill it twice.
+`401 402 403 429` also cool the account for `MAPLE_COOLDOWN_SECONDS`, which ranks
+it last, not never. Passwords are redacted from the log and from any error
+body relayed to a client (keys too, since 2026-11-16).
+Rotating a login works like rotating a key: `keys.env`, then restart.
 
 ### Why keys.env and not the bw-agent broker
 
@@ -150,8 +184,23 @@ is deterministic on any day, and test 7 covers the nearest-reset selection.
 wins, a latched or cooled tier sorts last, `TIER_ORDER` tie-breaks), with no
 process or network at all.
 
+`./tests-login.sh` covers transcription login mode the same way: a stub enclave
+that refuses API keys like the real one and echoes passwords back. It checks
+which refusals fail over and which cool an account, that the chat state is
+untouched, the no-logins fallback, a half-set tier, and that neither the log nor
+a relayed error body carries a password or key. `python3 test_logins.py`
+unit-tests the `MAPLE_LOGIN_*` parsing and the body redaction. Run all four in a
+Kata VM (`kata-run --cwd maple-shim -- …`), never on a laptop.
+
 ## Deploys
 
+- **2026-11-10 — transcription account login** (recorded 2026-11-16: the source
+  stayed in ubuntu-server `/root/staging/maple-shim-login/` until then).
+  `shim-derive-build.sh` swapped only `maple-shim.py` into the deployed
+  `:refresh-20261110` image (`d0bb293b`). The result,
+  `docker.io/kata/host-maple-shim:login-20261110` (`sha256:b467d484…`), was retagged
+  `:migrated` and the unit restarted 07:18Z. Rollback then: `:pre-login-20261110`.
+  `MAPLE_LOGIN_{MAX,PRO}_*` were added to `keys.env` the same day.
 - **2026-11-06 — Python 3.15.** Full base rebuild from `python:3.15-slim`
   (index `sha256:e97b88e4…`, Python 3.15.2, Debian 13) by `build-image.sh`
   (Renovate !3), imported as `docker.io/kata/host-maple-shim:py315` and retagged
@@ -193,6 +242,8 @@ ubuntu-server.
   `exhausted_at`, `resets`, `cooling_down`, `cooldown_until` and `last_error`
   (the upstream status and first 200 bytes of its message). No secrets.
   `resets` is reported whenever `exhausted_at` is set, not only while latched.
+  `transcription` has per-tier `login_configured` and `cooling_down` for login
+  mode (booleans only).
 - `GET  /v1/models`
 - `POST /v1/chat/completions` — streaming and non-streaming. SSE is relayed
   chunk by chunk under chunked transfer encoding; the body is forwarded as raw
@@ -207,7 +258,9 @@ ubuntu-server.
   proxy generations.
 - `POST /v1/audio/transcriptions` — OpenAI multipart in, OpenAI JSON out.
   Forces `whisper-large-v3`. A JSON body is passed through as the native Maple
-  contract instead.
+  contract instead. A token client's request authenticates as an account login
+  (see "Transcription needs an account login"); a relay-key client's request
+  goes out with its own key, as before.
 
 Point any OpenAI-compatible client at `https://100.64.0.11:62054/v1` with its
 per-client token. Audio endpoints need the paid Maple tier.
