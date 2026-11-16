@@ -236,6 +236,7 @@ A third-and-later field on a `tokens` line is a flag for that client.
 | openclaw (booty) | `127.0.0.1:18080` → socat → `:62054` | `maple-shim-tunnel.service` |
 | ourtranslate | `10.44.0.64:8176` | chat + `TTS_BACKEND`/`STT_BACKEND=maple` |
 | home-assistant | `10.44.0.64:8176/v1` | `native-audio`; `maple_tts` + `maple_stt` + `llama_conversation` |
+| sovtechpro[bot] broker (booty) | `127.0.0.1:18080` → socat → `:62054` | token label `sovtech-bot`, sealed on booty as `sovtech-bot.maple-key`; only the broker holds it, the bot's front doors and Maple coding jobs reach Maple through the broker |
 
 Home Assistant was found on 2026-09-02 holding a **raw Pro key** and pointing
 straight at maple-proxy — outside the shim, so it had no failover and simply
